@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "margin-referee"
-version = "0.1.0"
+version = "0.1.1"
 description = "Should you switch models? Replay your own eval set on a candidate and get a verdict that holds up."
 readme = "README.md"
 requires-python = ">=3.9"

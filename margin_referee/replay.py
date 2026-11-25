@@ -132,9 +132,14 @@ def verdict(res: Result, candidates: int = 1) -> dict:
         why = (f"{len(res.unanswered)} case(s) got no gradable answer" if res.unanswered
                else res.stopped) + ", so the comparison is incomplete"
     elif not pb.supported:
-        why = (f"with {k} models tried on these {n} cases it needs about "
-               f"{stats.gate_floor(k)}; confirm it alone on fresh cases" if n < stats.gate_floor(k)
-               else f"the quality bound is {pb.upper:.1%} behind, the bar allows {pb.margin:.1%}")
+        need = stats.gate_floor(k)
+        if n < need and k == 1:
+            why = f"{n} cases are too few to prove a switch: it needs about {need}"
+        elif n < need:
+            why = (f"with {k} models tried on these cases, the best needs about {need}; "
+                   "confirm it alone on fresh cases")
+        else:
+            why = f"the quality bound is {pb.upper:.1%} behind, the bar allows {pb.margin:.1%}"
     else:
         why = "the candidate costs more per case: an upgrade, not a saving"
     return {"cases": n, "baseline_passed": int(sum(b for _, b, _ in res.pairs)),

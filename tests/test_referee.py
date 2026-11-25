@@ -71,3 +71,10 @@ def test_fit_reports_ready_or_not(tmp_path, capsys):
     assert cli.main(["fit", str(f)]) == 2
     out = json.loads(capsys.readouterr().out)
     assert out["graded"] == 50 and out["needed"] == 111 and not out["ready"]
+
+
+def test_the_reason_fits_the_number_of_candidates():
+    res = replay.run(_cases(5), _fake([1] * 5, 0.01), _fake([1] * 5, 0.001), cap_usd=1, workers=1)
+    why = replay.verdict(res, 1)["why"]
+    assert why == "5 cases are too few to prove a switch: it needs about 100"
+    assert "confirm it alone on fresh cases" in replay.verdict(res, 3)["why"]
