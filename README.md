@@ -7,6 +7,9 @@ LangSmith or Langfuse dataset export, or JSONL) on the model you run today and o
 grades both with each case's own check, and tells you whether the candidate holds up and costs
 less. No account, no backend, no telemetry.
 
+Published on PyPI (https://pypi.org/project/margin-referee/) and GitHub
+(https://github.com/trymargin/margin-referee).
+
 ```
 pip install margin-referee
 margin-referee fit cases.jsonl

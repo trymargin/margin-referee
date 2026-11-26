@@ -138,7 +138,7 @@ def parse(text: str) -> Parsed:
         doc = None
     if isinstance(doc, dict) and "results" in doc:
         _promptfoo(doc, out)
-        return out
+        return _unique_ids(out)
     rows: Iterable = doc if isinstance(doc, list) else (
         [doc] if isinstance(doc, dict) else _lines(text))
     for i, row in enumerate(rows):
@@ -146,6 +146,24 @@ def parse(text: str) -> Parsed:
             _row(i, row, out)
         else:
             out.ungraded.append((f"case-{i}", "not a JSON object"))
+    return _unique_ids(out)
+
+
+def _unique_ids(out: Parsed) -> Parsed:
+    """Cases pair by id, so a repeated id (a promptfoo description used twice, say) would pair
+    one case's answers with another's. Repeats get ``#2``, ``#3``; the first keeps its name."""
+    from dataclasses import replace
+    taken, cases = {c.id for c in out.cases}, []
+    used: set[str] = set()
+    for c in out.cases:
+        name, n = c.id, 1
+        # a rename never takes a name already used, or one a later case carries as its own
+        while name in used or (name != c.id and name in taken):
+            n += 1
+            name = f"{c.id}#{n}"
+        used.add(name)
+        cases.append(c if name == c.id else replace(c, id=name))
+    out.cases = cases
     return out
 
 
