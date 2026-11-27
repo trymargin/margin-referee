@@ -3,11 +3,11 @@
 Can you ship this change? Ask your own eval set.
 
 `margin-referee` tests a change on the cases you already have (a promptfoo results file, a
-Braintrust, LangSmith or Langfuse dataset export, or JSONL): a new model, a new system prompt, or
-the same model on another endpoint. It runs what you use today and the candidate, grades both with
-each case's own check, and answers promote (ship it), a refusal (don't), or hold (not enough cases
-to tell). What the change does to cost is one line of the answer. No account, no backend, no
-telemetry.
+Braintrust, LangSmith or Langfuse dataset export, or JSONL): a new model, a new system prompt, a
+changed tool list, or the same model on another endpoint. It runs what you use today and the
+candidate, grades both with each case's own check, and answers promote (ship it), a refusal (don't),
+or hold (not enough cases to tell). What the change does to cost is one line of the answer. No
+account, no backend, no telemetry.
 
 Published on PyPI (https://pypi.org/project/margin-referee/) and GitHub
 (https://github.com/trymargin/margin-referee).
@@ -35,6 +35,8 @@ make it unreliable, and this tool corrects for each:
 - **Half-graded cases flatter the candidate.** A case with a check this tool cannot run (an LLM
   rubric, say) is left out and counted, never half-graded. An answer cut off by the output limit,
   or a call that errored, is unanswered, not a fail, and any unanswered case blocks a promotion.
+  It does not hide a loss: if the change is still worse than the bar allows with every unanswered
+  case counted as a win for the candidate, the answer is `do_not_ship`, not `not_enough_evidence`.
 
 ## What `replay` also does
 
@@ -51,6 +53,45 @@ make it unreliable, and this tool corrects for each:
   count) and `weighted` reports the same cases weighted by traffic, including the share of traffic
   on the cases that got worse. It is a weighting of the same cases, not a new test: the decision
   stays on the unweighted paired test.
+
+## Testing a tool change
+
+A tool description is a prompt the model reads on every call. Rewrite one, or add or remove a
+tool, and the agent may start calling the wrong tool. To test that before it ships, give each
+JSONL case the tools the call offers and say which tool it should call:
+
+```
+{"id": "refund-policy", "input": "How long do I have to return shoes?",
+ "tools": [{"type": "function", "function": {"name": "search_kb", "description": "Search.",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}}],
+ "check": "tool-call", "expected": "search_kb"}
+```
+
+- `tools` is an OpenAI-style function tool list, and `tool_choice` is optional. Both are sent
+  with every call, as they are.
+- `check: "tool-call"` passes when the model's first tool call is the `expected` tool. To check
+  arguments too, write pairs separated by `;`, such as
+  `name=lookup_order;args.order_id=A1042`. Values compare as text, ignoring case.
+- No tool call is a fail. A call whose arguments cannot be read, or an endpoint that does not
+  report tool calls, leaves the case unanswered. It is never counted as a pass.
+
+Then put the new tool list in a file and replay with `--candidate-tools`. The candidate gets
+that list in place of each case's tools; the baseline keeps the case's own. The model can stay
+the same:
+
+```
+cd examples/tool_change
+OPENROUTER_API_KEY=... margin-referee replay cases.jsonl \
+    --baseline openai/gpt-4.1 --candidate openai/gpt-4.1 \
+    --candidate-tools candidate_tools.json --cap 1
+```
+
+`examples/tool_change` has three cases and a `candidate_tools.json` that rewrites two vague
+descriptions. Three cases show the format and prove nothing: the verdict on them is
+`not_enough_evidence`, and `fit` says how many cases you need. Each tool list you try counts as
+a candidate, the same as a prompt. Tool cases run on OpenRouter and on OpenAI-compatible, Azure
+OpenAI and Vertex AI endpoints; a Bedrock endpoint leaves them unanswered for now. A promptfoo
+results file carries no tool list, so write tool cases as JSONL.
 
 ## A second opinion on a comparison you already ran
 
@@ -80,9 +121,47 @@ margin-referee hurdle .hurdle --compare model --baseline <model now> --candidate
 A task passes only if every repeat passed, and `repeats_passed` shows each side's count. A run
 Hurdle marked incomplete or unknown leaves its task unanswered, which blocks a promotion.
 
+## Judging an ontology layer: NVIDIA ontology-sql-eval
+
+Ran [ontology-sql-eval](https://github.com/NVIDIA/ontology-sql-eval) to compare a schema-only
+prompt with the ontology-grounded agent? `ontology-sql` reads the two arms' result files and
+says whether to ship the layer. It calls no model and needs nothing of NVIDIA's installed:
+
+```
+margin-referee ontology-sql runs
+margin-referee ontology-sql runs/full_20261126 --price-in 5 --price-out 25 --json
+```
+
+It reads `<run>/control/<dataset>.jsonl` and `<run>/treatment/<dataset>.jsonl`, pairs the
+questions by `task_id`, and applies the referee's rules, which are stricter than the harness's
+own report:
+
+- A pass is the verifier's positive verdict. A wrong result, a query that errored or timed out,
+  or no SQL in the answer is a fail.
+- A gold query that did not run, a run with no model output, an unknown error, or a question
+  one arm has no row for is unanswered. It is listed with its reason, counts as neither a pass
+  nor a fail, and blocks a promotion. The harness scores some of these as misses, so its
+  accuracy and this one can differ on the same run.
+- Tokens per question come from the per-call capture block on each row when the run recorded
+  one, otherwise from the ontology arm's own totals. Cost is those tokens times the
+  `--price-in` and `--price-out` you give (USD per million tokens). The files carry no price,
+  so without both flags cost reads `not_recorded` and nothing is guessed.
+- The ontology arm makes many more calls per question. If the pass rate only holds, the answer
+  is `not_enough_evidence`: a layer that is not cheaper ships on a proven gain. If the gain is
+  proven it reads `ship_if_worth_the_cost`, with the questions won and lost and the 95% bound
+  on the gain, and the decision to pay is yours.
+- Results are also read per `difficulty` (or `db_id`; choose with `--segment-by`), so a gain
+  overall cannot hide a loss on the hard questions.
+
+`--baseline-arm` and `--candidate-arm` name the two folders, or two rollout files, if yours are
+called something else. Swap them to ask the opposite question: can the layer be dropped?
+
+Not checked against a real run: the file layout and field names were read from the harness
+source at commit `871bb924` (2026-11-26) and the tests use rows made in that shape.
+
 ## A receipt for the verdict
 
-`replay`, `check` and `hurdle` take `--receipt out.json`. It writes the verdict as an
+`replay`, `check`, `hurdle` and `ontology-sql` take `--receipt out.json`. It writes the verdict as an
 [in-toto Statement](https://github.com/in-toto/attestation) in a DSSE envelope: the decision, the
 bar, the paired counts and gap, how many candidates were tried, cost per case, each segment, and a
 list of what the record does not show. A receipt you write this way is **unsigned** and says
@@ -109,6 +188,8 @@ what a person decided to ship.
   and you give your own per-token price, so a negotiated discount counts.
 - **A prompt change**: `--candidate-system` replays the candidate with a new system prompt. Each
   prompt you try counts as a candidate.
+- **A tool change**: `--candidate-tools` replays the candidate with a new tool list (see
+  "Testing a tool change").
 
 ## What it does not do
 

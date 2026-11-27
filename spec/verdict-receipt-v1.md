@@ -13,7 +13,7 @@ check it without trusting the tool that produced it.
 - **Subjects:** the sha256 of each side's setup string, named `baseline` and `candidate`.
 - **Signature:** Ed25519. A receipt Margin issues names its key by `keyid`, the sha256 of the raw
   public key. The public key is served at `https://trymargin.io/.well-known/margin-receipt-key`.
-- **Unsigned receipts** have an empty `signatures` list. `margin-referee replay|check|hurdle
+- **Unsigned receipts** have an empty `signatures` list. `margin-referee replay|check|hurdle|ontology-sql
   --receipt out.json` writes one with `assuranceLevel: self-run`. It is your own record, and its
   format is the same.
 

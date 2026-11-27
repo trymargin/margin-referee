@@ -13,7 +13,10 @@ from typing import Iterable, Optional
 
 #: A free-text expected answer longer than this is a judgement, not a label: never compared exactly.
 LABEL_MAX_CHARS = 80
-CHECKS = ("equals", "icontains", "contains", "regex", "is-json", "json-field", "json-match")
+CHECKS = ("equals", "icontains", "contains", "regex", "is-json", "json-field", "json-match",
+          "tool-call")
+#: A case carries at most this many tool definitions: they are sent with every call.
+MAX_TOOLS = 64
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,11 @@ class Case:
     #: The case's share of real traffic (a share or a count; ``weight`` or ``metadata.weight``).
     #: It weights the report only: the decision stays on the unweighted paired test.
     weight: Optional[float] = None
+    #: The tool definitions the production call offered (OpenAI function tools), sent as they
+    #: were. A replay's ``candidate_tools`` replaces them for the candidate side only.
+    tools: Optional[list] = None
+    #: The production call's ``tool_choice``, sent only together with tools.
+    tool_choice: Optional[object] = None
 
 
 @dataclass
@@ -71,6 +79,37 @@ def _label(expected) -> Optional[str]:
     return None
 
 
+def tool_list(x) -> Optional[list]:
+    """``x`` when it is an OpenAI-style function tool list (``[]`` means no tools), else None.
+    A list that is not one is never repaired or trimmed."""
+    ok = isinstance(x, list) and len(x) <= MAX_TOOLS and all(
+        isinstance(t, dict) and t.get("type") == "function"
+        and isinstance(t.get("function"), dict)
+        and isinstance(t["function"].get("name"), str) and t["function"]["name"].strip()
+        for t in x)
+    return x if ok else None
+
+
+def _tool_want(want: str) -> Optional[tuple]:
+    """A ``tool-call`` check's value as ``(tool name, {argument: wanted value})``. The value is a
+    bare tool name, or ``;``-separated pairs: ``name=<tool>`` and ``args.<field>=<value>``.
+    None when it names no tool or has a part that is neither."""
+    name, args = "", {}
+    for part in (p.strip() for p in want.split(";")):
+        key, eq, val = (x.strip() for x in part.partition("="))
+        if not part:
+            continue
+        if not eq and not name:
+            name = part
+        elif key == "name" and val and not name:
+            name = val
+        elif eq and key.startswith("args.") and key[5:]:
+            args[key[5:]] = val
+        else:
+            return None
+    return (name, args) if name else None
+
+
 def _segment(row) -> str:
     """The case's segment label, from the row or its metadata; empty when it has none."""
     if not isinstance(row, dict):
@@ -100,17 +139,29 @@ def _row(i: int, row: dict, out: Parsed) -> None:
     if msgs is None:
         out.ungraded.append((cid, "no input messages"))
         return
+    tools, choice = row.get("tools"), row.get("tool_choice")
+    if tools is not None and tool_list(tools) is None:
+        out.ungraded.append((cid, "its tools are not a list of function tools"))
+        return
+    if choice is not None and not isinstance(choice, (str, dict)):
+        out.ungraded.append((cid, "its tool_choice is not a string or an object"))
+        return
+    call = {"tools": tools or None, "tool_choice": choice if tools else None}
     check = row.get("check")
     if check is not None:
         if check not in CHECKS:
             out.ungraded.append((cid, f"check {check!r} is not deterministic"))
+            return
+        if check == "tool-call" and _tool_want(
+                str(row.get("expected", row.get("value", "")))) is None:
+            out.ungraded.append((cid, "its tool-call check names no tool"))
             return
         if check == "regex" and _bad_regex(str(row.get("expected", row.get("value", "")))):
             out.ungraded.append((cid, "its regex does not compile"))
             return
         out.cases.append(Case(cid, msgs, check, str(row.get("expected", row.get("value", ""))),
                               row.get("response_format"), row.get("max_tokens"),
-                              segment=_segment(row), weight=_weight(row)))
+                              segment=_segment(row), weight=_weight(row), **call))
         return
     keys = ("expected", "expectedOutput", "expected_output", "outputs", "output")
     expected = next((row[k] for k in keys if row.get(k) is not None), None)
@@ -119,13 +170,14 @@ def _row(i: int, row: dict, out: Parsed) -> None:
         # MAR-2313: a structured answer (several fields) is graded on every field, not left out
         out.cases.append(Case(cid, msgs, "json-match", json.dumps(expected),
                               row.get("response_format"), row.get("max_tokens"),
-                              segment=_segment(row), weight=_weight(row)))
+                              segment=_segment(row), weight=_weight(row), **call))
         return
     label = _label(expected)
     if label is None:
         out.ungraded.append((cid, "expected answer is free text, which needs a judge"))
         return
-    out.cases.append(Case(cid, msgs, "equals", label, segment=_segment(row), weight=_weight(row)))
+    out.cases.append(Case(cid, msgs, "equals", label, segment=_segment(row),
+                          weight=_weight(row), **call))
 
 
 def _promptfoo(doc: dict, out: Parsed) -> None:
@@ -212,13 +264,47 @@ def _lines(text: str):
                 yield None
 
 
-def grade(output: str, case: Case) -> bool:
-    """Pass only when the answer passes the case's check and every one in ``also``."""
-    return all(_check(output, c, v) for c, v in ((case.check, case.value), *case.also))
+def grade(output: str, case: Case, tool_calls: Optional[list] = None) -> bool:
+    """Pass only when the answer passes the case's check and every one in ``also``.
+    ``tool_calls`` is the response's tool calls (OpenAI shape), read by a ``tool-call`` check:
+    ``[]`` when the model made none, None when the response does not report them."""
+    return all(_check(output, c, v, tool_calls)
+               for c, v in ((case.check, case.value), *case.also))
 
 
-def _check(output: str, check: str, want: str) -> bool:
+def _tool_call_ok(tool_calls: Optional[list], want: str) -> bool:
+    """Whether the model's FIRST tool call is the wanted tool with the wanted arguments. No tool
+    call is a fail. ⛔ ``ValueError`` (no answer: neither a pass nor a fail) when the response
+    does not report tool calls, or the call or the arguments being checked cannot be read."""
+    wanted = _tool_want(want)
+    if wanted is None:
+        raise ValueError("the tool-call check names no tool")
+    if tool_calls is None:
+        raise ValueError("the response does not report tool calls")
+    if not tool_calls:
+        return False
+    fn = tool_calls[0].get("function") if isinstance(tool_calls[0], dict) else None
+    if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+        raise ValueError("the first tool call cannot be read")
+    if fn["name"] != wanted[0]:
+        return False
+    if not wanted[1]:
+        return True
+    got = fn.get("arguments")
+    try:
+        got = json.loads(got) if isinstance(got, str) else got
+    except ValueError:
+        got = None
+    if not isinstance(got, dict):
+        raise ValueError("the tool call's arguments are not a JSON object")
+    return all(k in got and str(got[k]).strip().lower() == v.lower()
+               for k, v in wanted[1].items())
+
+
+def _check(output: str, check: str, want: str, tool_calls: Optional[list] = None) -> bool:
     out = (output or "").strip()
+    if check == "tool-call":  # value names the tool (and arguments) the first tool call must be
+        return _tool_call_ok(tool_calls, want)
     if check == "equals":
         return out.lower().strip(" .\"'") == want.lower().strip(" .\"'")
     if check == "contains":

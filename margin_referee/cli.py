@@ -7,11 +7,12 @@
 ``fit`` is free and offline. ``replay`` calls models through OpenRouter with your own key
 (``OPENROUTER_API_KEY``), or a model in your own account with ``--candidate-endpoint`` /
 ``--baseline-endpoint`` (a JSON object: Bedrock, Vertex AI, Azure OpenAI or any
-OpenAI-compatible endpoint, with your per-token price).
+OpenAI-compatible endpoint, with your per-token price). ``--candidate-system`` tests a prompt
+change and ``--candidate-tools FILE.json`` a tool change.
 
-``replay``, ``check`` and ``hurdle`` take ``--receipt out.json`` to write the verdict as an
-UNSIGNED receipt (your own claim, ``assuranceLevel: self-run``). ``verify`` checks the signature
-on a receipt Margin issued.
+``replay``, ``check``, ``hurdle`` and ``ontology-sql`` take ``--receipt out.json`` to write the
+verdict as an UNSIGNED receipt (your own claim, ``assuranceLevel: self-run``). ``verify`` checks
+the signature on a receipt Margin issued.
 """
 from __future__ import annotations
 
@@ -112,11 +113,19 @@ def _replay(a) -> int:
     prompt = a.candidate_system
     label = cand.label + ("+system:" + hashlib.sha256(prompt.encode()).hexdigest()[:10]
                           if prompt else "")
+    tools = None
+    if a.candidate_tools:
+        tools = cases_mod.tool_list(json.loads(pathlib.Path(a.candidate_tools).read_text()))
+        if tools is None:
+            raise SystemExit("--candidate-tools is a JSON list of function tool definitions: "
+                             '[{"type": "function", "function": {"name": ...}}]')
+        label += "+tools:" + hashlib.sha256(
+            json.dumps(tools, sort_keys=True).encode()).hexdigest()[:10]
     # counted before the run: an early stop is corrected for every candidate tried
     tried = replay.record_and_count(parsed.cases, base.label, label)
     res = replay.run(parsed.cases, endpoints.chat_for(base), endpoints.chat_for(cand),
                      cap_usd=a.cap, candidate_system=a.candidate_system, repeats=a.repeats,
-                     early_stop=not a.no_early_stop, candidates=tried)
+                     early_stop=not a.no_early_stop, candidates=tried, candidate_tools=tools)
     v = replay.verdict(res, tried, {c.id: c.segment for c in parsed.cases},
                        tuple(a.critical or ()), {c.id: c.weight for c in parsed.cases})
     v.update(baseline=base.label, candidate=label, ungraded=len(parsed.ungraded),
@@ -152,6 +161,45 @@ def _hurdle(a) -> int:
     return 0 if v["promoted"] else 1
 
 
+def _ontology_sql(a) -> int:
+    from margin_referee import ontology_sql
+    try:
+        v = ontology_sql.compare(a.run_dir, baseline_arm=a.baseline_arm,
+                                 candidate_arm=a.candidate_arm, price_in=a.price_in,
+                                 price_out=a.price_out, candidates=a.candidates,
+                                 segment_by=a.segment_by, critical=tuple(a.critical or ()))
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    if not v["files_read"] or not (v["cases"] or v["unanswered"]):
+        print(json.dumps({"error": f"no rollout rows for {a.baseline_arm} and {a.candidate_arm} "
+                                   f"under {a.run_dir}"}))
+        return 2
+    if a.json:
+        print(json.dumps(v, indent=1))
+    else:
+        t = v["tokens"]
+        print("\n".join([
+            f"{v['decision']}: {v['why']}",
+            f"  {a.baseline_arm} passed {v['baseline_passed']} of {v['cases']}, "
+            f"{a.candidate_arm} passed {v['candidate_passed']}; {v['gain']['line']}",
+            f"  unanswered: {v['unanswered']}" + "".join(
+                f"\n    {r['cases']} x {r['reason']}" for r in v["unanswered_reasons"]),
+            "  tokens per question: " + (
+                f"{a.baseline_arm} {t['baseline']['input_per_case']:.0f} in / "
+                f"{t['baseline']['output_per_case']:.0f} out, {a.candidate_arm} "
+                f"{t['candidate']['input_per_case']:.0f} in / "
+                f"{t['candidate']['output_per_case']:.0f} out ({v['token_ratio']}x)"
+                if t["baseline"] and t["candidate"] else "not in these files"),
+            "  cost per question: " + (
+                f"{a.baseline_arm} ${v['baseline_cost_per_case']:.5f}, {a.candidate_arm} "
+                f"${v['candidate_cost_per_case']:.5f} ({v['cost_basis']})"
+                if v["baseline_cost_per_case"] is not None else v["cost_basis"]),
+            *(f"  {s['segment']}: {s['cases']} questions, won {s['won']}, lost {s['lost']}"
+              + (", worse" if s["worse"] else "") for s in v["segments"])]))
+    _write_receipt(a, v, a.baseline_arm, a.candidate_arm)
+    return 0 if v["promoted"] else 1
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="margin-referee", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -165,6 +213,9 @@ def main(argv=None) -> int:
     r.add_argument("--candidate", default="")
     r.add_argument("--cap", type=float, required=True, help="the most this replay may spend, USD")
     r.add_argument("--candidate-system", help="test a prompt change: the candidate's system prompt")
+    r.add_argument("--candidate-tools", metavar="FILE.json",
+                   help="test a tool change: a JSON list of function tools that replaces each "
+                        "case's tools for the candidate only")
     r.add_argument("--candidate-endpoint", help="JSON: a model in your own account")
     r.add_argument("--baseline-endpoint", help="JSON: a model in your own account")
     r.add_argument("--critical", action="append", metavar="SEGMENT",
@@ -192,7 +243,24 @@ def main(argv=None) -> int:
     h.add_argument("--candidate", required=True, help="the condition id or model to test")
     h.add_argument("--candidates", type=int, default=1,
                    help="how many conditions or models were tried on these tasks")
-    for p in (r, c, h):
+    o = sub.add_parser("ontology-sql", help="the verdict on an NVIDIA ontology-sql-eval run you "
+                       "already made (schema-only control vs the ontology arm); runs nothing")
+    o.add_argument("run_dir", help="the run's output folder, usually runs or your --run-dir")
+    o.add_argument("--baseline-arm", default="control",
+                   help="the arm you have now: a folder under the run dir, or a rollout file")
+    o.add_argument("--candidate-arm", default="treatment",
+                   help="the arm to judge (treatment is the ontology arm; ontology also works)")
+    o.add_argument("--price-in", type=float, help="USD per million input tokens")
+    o.add_argument("--price-out", type=float, help="USD per million output tokens")
+    o.add_argument("--segment-by", default="auto",
+                   choices=("auto", "difficulty", "db_id", "dataset", "none"),
+                   help="the row field to read each segment on (auto: difficulty, else db_id)")
+    o.add_argument("--critical", action="append", metavar="SEGMENT",
+                   help="a segment that is a release criterion (repeatable)")
+    o.add_argument("--candidates", type=int, default=1,
+                   help="how many setups were tried on these questions")
+    o.add_argument("--json", action="store_true", help="print the whole verdict as JSON")
+    for p in (r, c, h, o):
         p.add_argument("--receipt", metavar="OUT.json",
                        help="also write the verdict as an UNSIGNED receipt (in-toto Statement in "
                             "a DSSE envelope, assuranceLevel self-run)")
@@ -204,7 +272,7 @@ def main(argv=None) -> int:
     key.add_argument("--key-url", help="an https URL publishing it as JSON {public_key}")
     a = ap.parse_args(argv)
     return {"fit": _fit, "replay": _replay, "check": _check, "hurdle": _hurdle,
-            "verify": _verify}[a.cmd](a)
+            "ontology-sql": _ontology_sql, "verify": _verify}[a.cmd](a)
 
 
 if __name__ == "__main__":

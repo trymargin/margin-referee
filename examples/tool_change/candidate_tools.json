@@ -1,0 +1,38 @@
+[
+ {
+  "type": "function",
+  "function": {
+   "name": "lookup_order",
+   "description": "Fetch one order by its id: status, items, shipping address and delivery date. Use it for any question about a specific order.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "order_id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "order_id"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "search_kb",
+   "description": "Search the help centre for store policy: returns, refunds, shipping times, warranties. Use it when the question is not about one specific order.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   }
+  }
+ }
+]

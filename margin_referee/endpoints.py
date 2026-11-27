@@ -152,8 +152,14 @@ def chat_for(ep: Endpoint):
     """A ``chat`` callable shaped like ``providers.openrouter.chat`` for the replay. The OpenRouter
     routing policy kwargs are accepted and ignored: the call goes to the customer's own account."""
     def chat(messages, *, model=None, temperature=0.0, max_tokens=1024, response_format=None,
-             **_policy):
+             tools=None, tool_choice=None, **_policy):
         if ep.kind == "bedrock":
+            if tools:
+                # ponytail: Converse takes tools in its own shape (toolConfig / toolUse), not
+                # mapped here; the case is left unanswered and named, never run without them.
+                raise RuntimeError("tool definitions are not supported on a bedrock endpoint "
+                                   "yet; use an OpenAI-compatible endpoint for a tool case")
+            calls = None
             d = _post(ep.url, ep.headers, _bedrock_body(messages, max_tokens, temperature))
             text = "".join(c.get("text", "") for c in
                            ((d.get("output") or {}).get("message") or {}).get("content") or [])
@@ -165,11 +171,16 @@ def chat_for(ep: Endpoint):
                     "max_tokens": max_tokens}
             if response_format:
                 body["response_format"] = response_format
+            if tools:
+                body["tools"] = tools
+                if tool_choice is not None:
+                    body["tool_choice"] = tool_choice
             if ep.kind == "openrouter":
                 body["usage"] = {"include": True}
             d = _post(ep.url, ep.headers, body)
             choice = (d.get("choices") or [{}])[0]
             text = ((choice.get("message") or {}).get("content")) or ""
+            calls = (choice.get("message") or {}).get("tool_calls") or []
             u = d.get("usage") or {}
             tin, tout = int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
             finish = choice.get("finish_reason") or "stop"
@@ -183,7 +194,8 @@ def chat_for(ep: Endpoint):
         else:
             cost = (tin * ep.input_per_mtok + tout * ep.output_per_mtok) / 1e6
         return SimpleNamespace(text=text, cost_usd=cost, finish_reason=finish, input_tokens=tin,
-                               output_tokens=tout, cache_read_tokens=0, model=ep.label)
+                               output_tokens=tout, cache_read_tokens=0, model=ep.label,
+                               tool_calls=calls)
     return chat
 
 

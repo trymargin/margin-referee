@@ -50,28 +50,37 @@ def with_system(messages: list, system: Optional[str]) -> list:
     return [{"role": "system", "content": system}, *rest]
 
 
-def _one(case: Case, side: str, chat: Callable, system: Optional[str], max_tokens: int):
+def _one(case: Case, side: str, chat: Callable, system: Optional[str], max_tokens: int,
+         tools: Optional[list] = None):
+    """One call for one side. ``tools`` replaces the case's own tool list when given (``[]``
+    offers none); ``run`` gives it to the candidate only. ``tool_choice`` is sent only
+    together with tools."""
     msgs = with_system(case.messages, system) if side == "candidate" else case.messages
+    tools = case.tools if tools is None else tools
+    extra = {"tools": tools} if tools else {}
+    if tools and case.tool_choice is not None:
+        extra["tool_choice"] = case.tool_choice
     try:
         r = chat(msgs, max_tokens=case.max_tokens or max_tokens,
-                 response_format=case.response_format)
+                 response_format=case.response_format, **extra)
     except Exception as exc:  # noqa: BLE001 - an unanswered call is a missing pair, named
         return None, 0.0, f"{type(exc).__name__}: {exc}"[:200]
     if r.finish_reason == "length":
         return None, r.cost_usd, "cut off by the output limit"
     try:
-        return (1.0 if grade(r.text, case) else 0.0), r.cost_usd, None
+        passed = grade(r.text, case, getattr(r, "tool_calls", None))
+        return (1.0 if passed else 0.0), r.cost_usd, None
     except Exception as exc:  # noqa: BLE001 - a check that cannot run grades nothing
-        return None, r.cost_usd, f"check failed: {type(exc).__name__}"
+        return None, r.cost_usd, f"check failed: {type(exc).__name__}: {exc}"[:200]
 
 
 def _side(case: Case, side: str, chat: Callable, system: Optional[str], max_tokens: int,
-          repeats: int):
+          repeats: int, tools: Optional[list] = None):
     """``(strict score, mean cost of one run, total cost, error, each run's score)``: the side
     passes only when all ``repeats`` runs passed (pass^k). One run with no answer drops it."""
     scores, total = [], 0.0
     for _ in range(max(1, repeats)):
-        score, cost, err = _one(case, side, chat, system, max_tokens)
+        score, cost, err = _one(case, side, chat, system, max_tokens, tools)
         total += cost
         if err:
             return None, 0.0, total, err, []
@@ -82,14 +91,15 @@ def _side(case: Case, side: str, chat: Callable, system: Optional[str], max_toke
 def run(cases: list, baseline_chat: Callable, candidate_chat: Callable, *, cap_usd: float,
         candidate_system: Optional[str] = None, max_tokens: int = 8192,
         workers: int = 8, repeats: int = 1, early_stop: bool = True,
-        candidates: int = 1) -> Result:
+        candidates: int = 1, candidate_tools: Optional[list] = None) -> Result:
     """Both sides on every case until the next batch could cross ``cap_usd``.
 
     ``repeats`` runs each case that many times per side (spend scales with it; the cap prices a
     whole case, every repeat included). With ``early_stop``, once ``MIN_EARLY_STOP_CASES`` cases
     have both sides the replay stops as soon as the answer is already ``do_not_ship``, at a z
     corrected for the planned looks and the ``candidates`` tried; it never stops early for
-    ship."""
+    ship. ``candidate_tools`` is a tool change: the candidate is offered that tool list in
+    place of each case's own, and the baseline keeps the case's tools."""
     out, worst, i = Result(), 0.0, 0
     looks, looked = planned_looks(len(cases), workers), 0
 
@@ -98,7 +108,8 @@ def run(cases: list, baseline_chat: Callable, candidate_chat: Callable, *, cap_u
 
     def pair(case):
         b = _side(case, "baseline", baseline_chat, None, max_tokens, repeats)
-        c = _side(case, "candidate", candidate_chat, candidate_system, max_tokens, repeats)
+        c = _side(case, "candidate", candidate_chat, candidate_system, max_tokens, repeats,
+                  candidate_tools)
         return case, b, c
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         while i < len(cases):
@@ -214,13 +225,21 @@ def apply_segments(v: dict, segs: list) -> dict:
     return v
 
 
-def decision_terms(pb, complete: bool, cost: dict, n: int, floor: int, pairs: list) -> dict:
+def decision_terms(pb, complete: bool, cost: dict, n: int, floor: int, pairs: list,
+                   filled=None) -> dict:
     """ship / ship_if_worth_the_cost / do_not_ship / not_enough_evidence, the quality gap and
-    the cases that got worse. The same rule as Margin's hosted verdict (a parity test pins it)."""
+    the cases that got worse. The same rule as Margin's hosted verdict (a parity test pins it).
+
+    ``filled`` is the bound recomputed as if every unanswered case had gone the candidate's way
+    (:func:`filled_bound`). It can only turn ``unclear`` into ``worse``: a regression that
+    survives the most favourable fill is proven whatever the missing answers were. It never
+    reaches ``holds``: an unanswered case never helps a change ship."""
     if pb is not None and complete and pb.supported and n >= floor:
         quality = "holds"
     elif pb is not None and complete and (2 * pb.shortfall - pb.upper) > pb.margin:
         quality = "worse"
+    elif filled is not None and (2 * filled.shortfall - filled.upper) > filled.margin:
+        quality = "worse"  # ... and still is with every unanswered case given to the candidate
     else:
         quality = "unclear"
     b, c = cost.get("baseline"), cost.get("candidate")
@@ -237,6 +256,37 @@ def decision_terms(pb, complete: bool, cost: dict, n: int, floor: int, pairs: li
                                    "bar_allows_points": round(-100 * pb.margin, 2) + 0.0}
     return {"decision": decision, "quality": quality, "cost": cost_word,
             "quality_gap": gap, "worse_cases": worse}
+
+
+def filled_bound(pairs: list, unanswered: int, stopped: str, bound):
+    """The paired bound as if each unanswered case were one the baseline failed and the candidate
+    passed: the reading most favourable to the candidate. None unless unanswered cases are the
+    only thing missing: a replay stopped by its cap never ran the rest of the set, and nobody
+    knows how many of those would have gone unanswered."""
+    if not unanswered or stopped or not pairs:
+        return None
+    return bound([(b, c) for _, b, c in pairs] + [(0.0, 1.0)] * unanswered)
+
+
+def worse_despite_missing(unanswered: list) -> str:
+    return ("worse than the bar allows even if every one of the "
+            f"{len(unanswered)} unanswered case(s) had gone the candidate's way"
+            f"{_top_reason(unanswered)}")
+
+
+def unanswered_reasons(unanswered: list, top: int = 5) -> list:
+    """Why cases got no gradable answer, most common first: ``[{reason, cases}]``. A reader seeing
+    "79 cases got no answer" needs to know whether that is a cap, a timeout or a broken check
+    (R11, 2026-11-27: 79 IFEval answers were cut off at a 2,048-token cap and the verdict did not
+    say so)."""
+    from collections import Counter
+    c = Counter(str(u[-1])[:120] for u in unanswered)
+    return [{"reason": r, "cases": n} for r, n in c.most_common(top)]
+
+
+def _top_reason(unanswered: list) -> str:
+    r = unanswered_reasons(unanswered, 1)
+    return f" (most: {r[0]['reason']}, {r[0]['cases']} case(s))" if r else ""
 
 
 def verdict(res: Result, candidates: int = 1, seg_of: Optional[dict] = None,
@@ -258,7 +308,8 @@ def verdict(res: Result, candidates: int = 1, seg_of: Optional[dict] = None,
     elif pb is None:
         why = "no case ran on both models"
     elif not complete:
-        why = (f"{len(res.unanswered)} case(s) got no gradable answer" if res.unanswered
+        why = (f"{len(res.unanswered)} case(s) got no gradable answer{_top_reason(res.unanswered)}"
+               if res.unanswered
                else res.stopped) + ", so the comparison is incomplete"
     elif not pb.supported:
         need = stats.gate_floor(k)
@@ -271,7 +322,11 @@ def verdict(res: Result, candidates: int = 1, seg_of: Optional[dict] = None,
             why = f"the quality bound is {pb.upper:.1%} behind, the bar allows {pb.margin:.1%}"
     else:
         why = "the candidate costs more per case: an upgrade, not a saving"
-    terms = decision_terms(pb, complete, cost, n, stats.gate_floor(k), res.pairs)
+    filled = filled_bound(res.pairs, len(res.unanswered), res.stopped,
+                          lambda ps: stats.paired_bound(ps, z=stats.family_z(k * looks)))
+    terms = decision_terms(pb, complete, cost, n, stats.gate_floor(k), res.pairs, filled)
+    if terms["quality"] == "worse" and not complete:
+        why = worse_despite_missing(res.unanswered)
     outv = {**terms, "cases": n, "baseline_passed": int(sum(b for _, b, _ in res.pairs)),
             "candidate_passed": int(sum(c for _, _, c in res.pairs)),
             "baseline_cost_per_case": cost["baseline"],
@@ -279,6 +334,7 @@ def verdict(res: Result, candidates: int = 1, seg_of: Optional[dict] = None,
             "candidates_tried": k, "cases_needed": stats.gate_floor(k),
             "lost": pb.baseline_only if pb else 0, "won": pb.candidate_only if pb else 0,
             "promoted": promoted, "why": why, "unanswered": len(res.unanswered),
+            "unanswered_reasons": unanswered_reasons(res.unanswered),
             "stopped": res.stopped, "spend_usd": round(res.spend_usd, 6)}
     repeats = max((len(x) for s in res.runs.values() for x in s.values()), default=1)
     outv["repeats"] = repeats

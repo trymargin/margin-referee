@@ -52,6 +52,51 @@ def test_an_unanswered_case_promotes_nothing():
     assert not v["promoted"] and v["unanswered"] == 120
 
 
+def _candidate(fails: int, errors_at: set):
+    """Fails the first ``fails`` cases, raises on the cases numbered in ``errors_at``."""
+    def chat(messages, **_):
+        i = int(messages[-1]["content"][1:])
+        if i in errors_at:
+            raise RuntimeError("HTTP Error 402: Payment Required")
+        return SimpleNamespace(text="no" if i < fails else "yes", cost_usd=0.001,
+                               finish_reason="stop")
+    return chat
+
+
+def test_a_failed_call_does_not_hide_a_loss_it_could_not_have_rescued():
+    """20 lost and none won on 199 answered cases: still worse with the one unanswered case
+    counted as a win for the candidate, so it is do_not_ship, not not_enough_evidence."""
+    res = replay.run(_cases(200), _fake([1] * 200, 0.01), _candidate(20, {199}), cap_usd=10,
+                     workers=1, early_stop=False)
+    v = replay.verdict(res)
+    assert (v["cases"], v["lost"], v["won"], v["unanswered"]) == (199, 20, 0, 1)
+    assert (v["decision"], v["quality"], v["promoted"]) == ("do_not_ship", "worse", False)
+    assert v["why"].startswith("worse than the bar allows even if every one of the 1 unanswered "
+                               "case(s) had gone the candidate's way (most: RuntimeError")
+
+
+def test_a_failed_call_that_could_have_rescued_it_is_still_not_enough_evidence():
+    """12 lost on 199: worse on the answered cases alone, but one more candidate win would put
+    it back inside the bar, so the missing answer still matters."""
+    res = replay.run(_cases(200), _fake([1] * 200, 0.01), _candidate(12, {199}), cap_usd=10,
+                     workers=1, early_stop=False)
+    v = replay.verdict(res)
+    assert (v["cases"], v["lost"], v["unanswered"]) == (199, 12, 1)
+    assert (v["decision"], v["quality"]) == ("not_enough_evidence", "unclear")
+
+
+def test_unanswered_cases_never_ship_and_a_capped_replay_is_judged_as_before():
+    clean = replay.run(_cases(200), _fake([1] * 200, 0.01), _candidate(0, {7}), cap_usd=10,
+                       workers=1, early_stop=False)
+    v = replay.verdict(clean)
+    assert v["decision"] == "not_enough_evidence" and not v["promoted"]
+    capped = replay.run(_cases(200), _fake([1] * 200, 0.01), _candidate(20, {50}), cap_usd=1.1,
+                        workers=1, early_stop=False)
+    v = replay.verdict(capped)
+    assert capped.stopped and v["lost"] == 20 and v["unanswered"] == 1
+    assert v["decision"] == "not_enough_evidence" and "even if every one" not in v["why"]
+
+
 def test_renaming_cases_does_not_reset_the_count_but_fresh_cases_do(tmp_path):
     ledger = tmp_path / "ledger.json"
     assert replay.record_and_count(_cases(150), "b", "m1", ledger) == 1
