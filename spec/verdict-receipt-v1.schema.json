@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trymargin.io/verdict-receipt/v1/schema.json",
+  "title": "Verdict receipt v1: the in-toto Statement inside the DSSE envelope",
+  "type": "object",
+  "required": ["_type", "subject", "predicateType", "predicate"],
+  "properties": {
+    "_type": {"const": "https://in-toto.io/Statement/v1"},
+    "predicateType": {"const": "https://trymargin.io/verdict-receipt/v1"},
+    "subject": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "items": {
+        "type": "object", "required": ["name", "digest"],
+        "properties": {
+          "name": {"enum": ["baseline", "candidate"]},
+          "digest": {"type": "object", "required": ["sha256"],
+                     "properties": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}
+        }
+      }
+    },
+    "predicate": {
+      "type": "object",
+      "required": ["verdictId", "decision", "why", "decisionRule", "setups", "paired",
+                   "candidatesTried", "costPerCase", "segments", "worseCases", "casesDigest",
+                   "issuer", "createdAt", "assuranceLevel", "nonClaims"],
+      "properties": {
+        "verdictId": {"type": ["string", "null"]},
+        "decision": {"enum": ["ship", "ship_if_worth_the_cost", "do_not_ship", "not_enough_evidence"]},
+        "why": {"type": ["string", "null"]},
+        "decisionRule": {"type": "object", "required": ["metric", "bar", "direction"],
+                         "properties": {"bar": {"type": "number"}}},
+        "setups": {"type": "object", "required": ["baseline", "candidate"]},
+        "paired": {
+          "type": "object",
+          "required": ["cases", "won", "lost", "baselinePassed", "candidatePassed", "qualityGap"],
+          "properties": {
+            "qualityGap": {"type": "object",
+                           "required": ["estimatePoints", "worstCasePoints", "barAllowsPoints"]}
+          }
+        },
+        "candidatesTried": {"type": ["integer", "null"]},
+        "costPerCase": {"type": "object", "required": ["baseline", "candidate"]},
+        "segments": {"type": "array"},
+        "worseCases": {"type": "array"},
+        "casesDigest": {"type": ["string", "null"]},
+        "issuer": {"type": "string"},
+        "createdAt": {"type": "string"},
+        "assuranceLevel": {"enum": ["run-by-margin", "scored-by-customer", "self-run", "unknown"]},
+        "nonClaims": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+      }
+    }
+  }
+}

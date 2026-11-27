@@ -78,3 +78,54 @@ def test_the_reason_fits_the_number_of_candidates():
     why = replay.verdict(res, 1)["why"]
     assert why == "5 cases are too few to prove a switch: it needs about 100"
     assert "confirm it alone on fresh cases" in replay.verdict(res, 3)["why"]
+
+
+def test_a_clearly_bad_candidate_stops_early_and_a_stop_never_ships():
+    cases = _cases(300)
+    res = replay.run(cases, _fake([1] * 300, 0.01), _fake([0] * 300, 0.001), cap_usd=10)
+    assert res.stopped_early["after_cases"] == len(res.pairs) == 41 and res.stopped == ""
+    v = replay.verdict(res)
+    assert v["decision"] == "do_not_ship" and not v["promoted"]
+    assert "the remaining 259 cases were not run because the answer was already clear" in v["why"]
+    full = replay.run(cases, _fake([1] * 300, 0.01), _fake([0] * 300, 0.001), cap_usd=10,
+                      early_stop=False)
+    assert full.stopped_early is None and len(full.pairs) == 300
+    assert res.spend_usd < full.spend_usd / 7
+    good = replay.run(_cases(120), _fake([1] * 120, 0.01), _fake([1] * 120, 0.001), cap_usd=10)
+    assert good.stopped_early is None and replay.verdict(good)["decision"] == "ship"
+    good.stopped_early = {"after_cases": 120, "of_cases": 300, "looks": 1, "reason": "x"}
+    assert replay.verdict(good)["decision"] == "not_enough_evidence"
+
+
+def test_with_repeats_a_case_passes_only_if_every_run_passed():
+    runs: dict = {}
+
+    def flaky(messages, **_):  # fails its second run of the first three cases
+        q = messages[-1]["content"]
+        runs[q] = runs.get(q, 0) + 1
+        bad = q in ("q0", "q1", "q2") and runs[q] == 2
+        return SimpleNamespace(text="no" if bad else "yes", cost_usd=0.001, finish_reason="stop")
+    res = replay.run(_cases(120), _fake([1] * 360, 0.01), flaky, cap_usd=10, repeats=3)
+    assert [c for _, _, c in res.pairs[:4]] == [0.0, 0.0, 0.0, 1.0]
+    assert res.spend_usd == pytest.approx(120 * 3 * 0.011)
+    v = replay.verdict(res)
+    r = v["reliability"]
+    assert v["repeats"] == 3 and v["candidate_passed"] == 117
+    assert v["candidate_cost_per_case"] == pytest.approx(0.001)  # one run's cost, not three
+    assert r["candidate"]["flipped_cases"] == ["c0", "c1", "c2"]
+    assert r["candidate"]["pass_pow_k"] == 0.975 and r["candidate"]["pass_at_1"] == 0.9917
+    assert r["baseline"]["flipped"] == 0 and r["runs_needed"]["estimate"] is True
+    one = replay.run(_cases(120), _fake([1] * 120, 0.01), _fake([1] * 120, 0.001), cap_usd=10)
+    assert replay.verdict(one)["reliability"] is None
+
+
+def test_weights_report_the_traffic_on_worse_cases_and_leave_the_decision():
+    res = replay.Result()
+    res.pairs = [(f"c{i}", 1.0, 0.0 if i == 0 else 1.0) for i in range(400)]
+    res.cost = {"baseline": 4.0, "candidate": 0.4}
+    plain = replay.verdict(res)
+    v = replay.verdict(res, weight_of={f"c{i}": (600 if i == 0 else 1) for i in range(400)})
+    assert plain["weighted"] is None and v["decision"] == plain["decision"] == "ship"
+    assert v["weighted"]["worse_traffic_share"] == round(600 / 999, 4)
+    assert "breaks cases covering 60.1% of your traffic" in v["why"]
+    assert "not a new test" in v["weighted"]["note"]

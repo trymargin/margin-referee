@@ -20,7 +20,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from margin_referee import stats
-from margin_referee.cases import Case, grade
+from margin_referee.cases import (MIN_EARLY_STOP_CASES, Case, apply_extras, grade,
+                                  planned_looks, reliability_terms, stop_early,
+                                  weighted_terms)
 
 LEDGER = pathlib.Path(os.environ.get("MARGIN_REFEREE_LEDGER",
                                      pathlib.Path.home() / ".margin-referee" / "ledger.json"))
@@ -34,6 +36,11 @@ class Result:
     unanswered: list = field(default_factory=list)     # (case id, side, why)
     stopped: str = ""
     spend_usd: float = 0.0
+    #: With repeats: ``{case id: {side: [each run's score]}}``; ``pairs`` holds the strict result.
+    runs: dict = field(default_factory=dict)
+    #: Set when the replay stopped because the answer was already ``do_not_ship``: a deliberate
+    #: stop, not a failure, so ``stopped`` stays empty.
+    stopped_early: Optional[dict] = None
 
 
 def with_system(messages: list, system: Optional[str]) -> list:
@@ -58,15 +65,40 @@ def _one(case: Case, side: str, chat: Callable, system: Optional[str], max_token
         return None, r.cost_usd, f"check failed: {type(exc).__name__}"
 
 
+def _side(case: Case, side: str, chat: Callable, system: Optional[str], max_tokens: int,
+          repeats: int):
+    """``(strict score, mean cost of one run, total cost, error, each run's score)``: the side
+    passes only when all ``repeats`` runs passed (pass^k). One run with no answer drops it."""
+    scores, total = [], 0.0
+    for _ in range(max(1, repeats)):
+        score, cost, err = _one(case, side, chat, system, max_tokens)
+        total += cost
+        if err:
+            return None, 0.0, total, err, []
+        scores.append(score)
+    return min(scores), total / len(scores), total, None, scores
+
+
 def run(cases: list, baseline_chat: Callable, candidate_chat: Callable, *, cap_usd: float,
         candidate_system: Optional[str] = None, max_tokens: int = 8192,
-        workers: int = 8) -> Result:
-    """Both sides on every case until the next batch could cross ``cap_usd``."""
+        workers: int = 8, repeats: int = 1, early_stop: bool = True,
+        candidates: int = 1) -> Result:
+    """Both sides on every case until the next batch could cross ``cap_usd``.
+
+    ``repeats`` runs each case that many times per side (spend scales with it; the cap prices a
+    whole case, every repeat included). With ``early_stop``, once ``MIN_EARLY_STOP_CASES`` cases
+    have both sides the replay stops as soon as the answer is already ``do_not_ship``, at a z
+    corrected for the planned looks and the ``candidates`` tried; it never stops early for
+    ship."""
     out, worst, i = Result(), 0.0, 0
+    looks, looked = planned_looks(len(cases), workers), 0
+
+    def bound(ps, family):
+        return stats.paired_bound(ps, z=stats.family_z(family))
 
     def pair(case):
-        b = _one(case, "baseline", baseline_chat, None, max_tokens)
-        c = _one(case, "candidate", candidate_chat, candidate_system, max_tokens)
+        b = _side(case, "baseline", baseline_chat, None, max_tokens, repeats)
+        c = _side(case, "candidate", candidate_chat, candidate_system, max_tokens, repeats)
         return case, b, c
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         while i < len(cases):
@@ -76,8 +108,8 @@ def run(cases: list, baseline_chat: Callable, candidate_chat: Callable, *, cap_u
                 out.stopped = f"stopped at the ${cap_usd:.2f} cap after {i} cases"
                 break
             batch = cases[i:i + (1 if worst == 0 else size)]
-            for case, (bs, bc, be), (cs, cc, cerr) in pool.map(pair, batch):
-                spent = bc + cc
+            for case, (bs, bc, bt, be, br), (cs, cc, ct, cerr, cr) in pool.map(pair, batch):
+                spent = bt + ct
                 out.spend_usd += spent
                 worst = max(worst, spent)
                 if be or cerr:
@@ -87,7 +119,16 @@ def run(cases: list, baseline_chat: Callable, candidate_chat: Callable, *, cap_u
                 out.cost["baseline"] += bc
                 out.cost["candidate"] += cc
                 out.pairs.append((case.id, bs, cs))
+                if repeats > 1:
+                    out.runs[case.id] = {"baseline": br, "candidate": cr}
             i += len(batch)
+            # never more looks than the test was corrected for (a tight cap shrinks batches)
+            if early_stop and looked < looks and len(out.pairs) >= MIN_EARLY_STOP_CASES:
+                looked += 1
+                out.stopped_early = stop_early(out.pairs, len(cases), looks, bound, candidates,
+                                               len(out.unanswered))
+                if out.stopped_early:
+                    break
     return out
 
 
@@ -114,12 +155,100 @@ def record_and_count(cases: list, baseline: str, candidate: str,
     return len(tried | {candidate})
 
 
-def verdict(res: Result, candidates: int = 1) -> dict:
+#: A segment is judged on its own only with at least this many paired cases.
+MIN_SEGMENT_CASES = 10
+
+
+def segment_terms(pairs, seg_of: dict, bound, k: int, complete: bool, critical=(),
+                  floor=None) -> list:
+    """Each labelled segment's own reading: cases, lost, won, and ``worse`` when even the
+    favourable bound misses the bar there. The z is corrected for every segment looked at, so
+    slicing finely cannot manufacture a loss. A ``critical`` segment (a release criterion the team
+    names) also gets ``holds``: proven not worse on its own, on enough of its own cases
+    (``floor(looks)``). Empty when fewer than two segments are labelled and none is critical."""
+    groups: dict = {}
+    for cid, b, c in pairs:
+        groups.setdefault(seg_of.get(cid, ""), []).append((b, c))
+    crit = {str(c) for c in critical if str(c)}
+    named = sorted({g for g in groups if g} | crit)
+    if len(named) < 2 and not crit:
+        return []
+    looks = max(1, k) * len(named)
+    out = []
+    for g in named:
+        ps = groups.get(g, [])
+        pb = bound(ps, looks) if len(ps) >= MIN_SEGMENT_CASES else None
+        row = {"segment": g, "cases": len(ps), "lost": sum(1 for b, c in ps if b > c),
+               "won": sum(1 for b, c in ps if c > b),
+               "worse": bool(pb is not None and complete
+                             and (2 * pb.shortfall - pb.upper) > pb.margin)}
+        if g in crit:
+            need = floor(looks) if floor else None
+            row.update(critical=True, cases_needed=need,
+                       holds=bool(pb is not None and complete and pb.upper <= pb.margin
+                                  and need is not None and len(ps) >= need))
+        out.append(row)
+    return out
+
+
+def apply_segments(v: dict, segs: list) -> dict:
+    """A change proven worse in a segment does not ship, whatever the overall reading; a change
+    not proven to hold in a release-critical segment is not enough evidence."""
+    v["segments"] = segs
+    shippable = v["decision"] in ("ship", "ship_if_worth_the_cost")
+    worse = [s["segment"] for s in segs if s["worse"]]
+    unproven = [s for s in segs if s.get("critical") and not s.get("holds") and not s["worse"]]
+    if worse and v["decision"] != "do_not_ship":
+        v["decision"], v["quality"], v["promoted"] = "do_not_ship", "worse_in_segment", False
+        v["why"] = ((f"it holds overall but is worse than the bar allows in {', '.join(worse)}; "
+                     if shippable else
+                     f"it is proven worse than the bar allows in {', '.join(worse)}; ")
+                    + "ship it only where it holds, or not at all")
+    elif unproven and shippable:
+        s = unproven[0]
+        v["decision"], v["quality"] = "not_enough_evidence", "unproven_in_critical_segment"
+        v["promoted"] = False
+        v["why"] = (f"it holds overall, but the release-critical segment {s['segment']} has "
+                    f"{s['cases']} case(s) and is not proven to hold on its own; it needs about "
+                    f"{s['cases_needed']}")
+    return v
+
+
+def decision_terms(pb, complete: bool, cost: dict, n: int, floor: int, pairs: list) -> dict:
+    """ship / ship_if_worth_the_cost / do_not_ship / not_enough_evidence, the quality gap and
+    the cases that got worse. The same rule as Margin's hosted verdict (a parity test pins it)."""
+    if pb is not None and complete and pb.supported and n >= floor:
+        quality = "holds"
+    elif pb is not None and complete and (2 * pb.shortfall - pb.upper) > pb.margin:
+        quality = "worse"
+    else:
+        quality = "unclear"
+    b, c = cost.get("baseline"), cost.get("candidate")
+    if b is None or c is None or (b == 0 and c == 0):
+        cost_word = "unknown"
+    else:
+        cost_word = "cheaper" if c < b else "dearer" if c > b else "same"
+    decision = ("do_not_ship" if quality == "worse" else "not_enough_evidence"
+                if quality == "unclear" else "ship_if_worth_the_cost" if cost_word == "dearer"
+                else "ship")
+    worse = [k for k, bs, cs in pairs if bs > cs][:10]
+    gap = None if pb is None else {"estimate_points": round(-100 * pb.shortfall, 2) + 0.0,
+                                   "worst_case_points": round(-100 * pb.upper, 2) + 0.0,
+                                   "bar_allows_points": round(-100 * pb.margin, 2) + 0.0}
+    return {"decision": decision, "quality": quality, "cost": cost_word,
+            "quality_gap": gap, "worse_cases": worse}
+
+
+def verdict(res: Result, candidates: int = 1, seg_of: Optional[dict] = None,
+            critical: tuple = (), weight_of: Optional[dict] = None) -> dict:
     """Promoted only when the paired test clears the bar for ``candidates`` tried, the candidate
     costs less per case, and every case got a gradable answer from both sides."""
     n = len(res.pairs)
     k = max(1, candidates)
-    pb = stats.paired_bound([(b, c) for _, b, c in res.pairs], z=stats.family_z(k))
+    # an early stop looked at the result ``looks`` times, so its bound is held to that family
+    early = res.stopped_early
+    looks = max(1, int(early["looks"])) if early else 1
+    pb = stats.paired_bound([(b, c) for _, b, c in res.pairs], z=stats.family_z(k * looks))
     cost = {s: (v / n if n else None) for s, v in res.cost.items()}
     cheaper = n > 0 and cost["candidate"] < cost["baseline"]
     complete = not res.unanswered and not res.stopped
@@ -142,7 +271,8 @@ def verdict(res: Result, candidates: int = 1) -> dict:
             why = f"the quality bound is {pb.upper:.1%} behind, the bar allows {pb.margin:.1%}"
     else:
         why = "the candidate costs more per case: an upgrade, not a saving"
-    return {"cases": n, "baseline_passed": int(sum(b for _, b, _ in res.pairs)),
+    terms = decision_terms(pb, complete, cost, n, stats.gate_floor(k), res.pairs)
+    outv = {**terms, "cases": n, "baseline_passed": int(sum(b for _, b, _ in res.pairs)),
             "candidate_passed": int(sum(c for _, _, c in res.pairs)),
             "baseline_cost_per_case": cost["baseline"],
             "candidate_cost_per_case": cost["candidate"],
@@ -150,3 +280,11 @@ def verdict(res: Result, candidates: int = 1) -> dict:
             "lost": pb.baseline_only if pb else 0, "won": pb.candidate_only if pb else 0,
             "promoted": promoted, "why": why, "unanswered": len(res.unanswered),
             "stopped": res.stopped, "spend_usd": round(res.spend_usd, 6)}
+    repeats = max((len(x) for s in res.runs.values() for x in s.values()), default=1)
+    outv["repeats"] = repeats
+    outv = apply_segments(outv, segment_terms(
+        res.pairs, seg_of or {},
+        lambda ps, kk: stats.paired_bound(ps, z=stats.family_z(kk * looks)),
+        k, complete, critical, stats.gate_floor))
+    return apply_extras(outv, early, k, reliability_terms(res.runs, repeats),
+                        weighted_terms(res.pairs, weight_of or {}))

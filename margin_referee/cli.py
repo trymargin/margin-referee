@@ -1,4 +1,4 @@
-"""margin-referee: should you switch models? Ask your own eval set.
+"""margin-referee: can you ship this AI change? Ask your own eval cases.
 
     margin-referee fit results.json
     margin-referee replay cases.jsonl --baseline openai/gpt-4.1 \
@@ -8,6 +8,10 @@
 (``OPENROUTER_API_KEY``), or a model in your own account with ``--candidate-endpoint`` /
 ``--baseline-endpoint`` (a JSON object: Bedrock, Vertex AI, Azure OpenAI or any
 OpenAI-compatible endpoint, with your per-token price).
+
+``replay``, ``check`` and ``hurdle`` take ``--receipt out.json`` to write the verdict as an
+UNSIGNED receipt (your own claim, ``assuranceLevel: self-run``). ``verify`` checks the signature
+on a receipt Margin issued.
 """
 from __future__ import annotations
 
@@ -20,6 +24,61 @@ import sys
 
 from margin_referee import cases as cases_mod
 from margin_referee import endpoints, replay, stats
+
+
+def _write_receipt(a, v: dict, baseline: str, candidate: str, cases_digest=None) -> None:
+    """``--receipt``: this verdict as an UNSIGNED receipt. Nobody signed it and it says so."""
+    if not getattr(a, "receipt", None):
+        return
+    from datetime import datetime, timezone
+    from margin_referee import receipt
+    st = receipt.statement(v, baseline=baseline, candidate=candidate, issuer="self",
+                           assurance_level="self-run", cases_digest=cases_digest,
+                           created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    pathlib.Path(a.receipt).write_text(json.dumps(receipt.envelope(st), indent=1) + "\n")
+    print(f"wrote an UNSIGNED receipt to {a.receipt} (self-run: your own claim, signed by "
+          "nobody)", file=sys.stderr)
+
+
+class _Usage(Exception):
+    """``verify`` could not check anything: no key, or the key could not be fetched."""
+
+
+def _verify(a) -> int:
+    """0 when the signature verifies, 1 when it does not (or there is none), 2 when it cannot
+    be checked."""
+    from margin_referee import receipt
+    try:
+        doc = json.loads(pathlib.Path(a.file).read_text())
+        if not receipt.is_signed(doc):
+            print(json.dumps({"verified": False, "signed": False,
+                              "reason": "UNSIGNED: nobody signed this receipt; it is its "
+                                        "producer's own claim",
+                              "statement": receipt.decode(doc)}, indent=1))
+            return 1
+        key = a.key
+        if not key and a.key_url:
+            if not a.key_url.startswith("https://"):
+                raise _Usage("--key-url must be https")
+            import urllib.request
+            with urllib.request.urlopen(a.key_url, timeout=15) as resp:  # noqa: S310 (https)
+                key = (json.loads(resp.read()) or {}).get("public_key")
+            if not key:
+                raise _Usage(f"{a.key_url} published no public_key")
+        if not key:
+            raise _Usage("this receipt is signed: pass --key or --key-url to check it")
+        st = receipt.verify(doc, key)
+    except (receipt.MissingDependency, _Usage, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except (receipt.ReceiptError, json.JSONDecodeError) as exc:
+        print(json.dumps({"verified": False, "reason": str(exc)}, indent=1))
+        return 1
+    print(json.dumps({"verified": True, "signed": True,
+                      "meaning": "signed by the holder of this key and not edited since; "
+                                 "read nonClaims for what it does not show",
+                      "statement": st}, indent=1))
+    return 0
 
 
 def _fit(a) -> int:
@@ -50,17 +109,46 @@ def _replay(a) -> int:
         return 2
     base = _endpoint(a.baseline_endpoint, a.baseline)
     cand = _endpoint(a.candidate_endpoint, a.candidate)
-    res = replay.run(parsed.cases, endpoints.chat_for(base), endpoints.chat_for(cand),
-                     cap_usd=a.cap, candidate_system=a.candidate_system)
     prompt = a.candidate_system
     label = cand.label + ("+system:" + hashlib.sha256(prompt.encode()).hexdigest()[:10]
                           if prompt else "")
+    # counted before the run: an early stop is corrected for every candidate tried
     tried = replay.record_and_count(parsed.cases, base.label, label)
-    v = replay.verdict(res, tried)
+    res = replay.run(parsed.cases, endpoints.chat_for(base), endpoints.chat_for(cand),
+                     cap_usd=a.cap, candidate_system=a.candidate_system, repeats=a.repeats,
+                     early_stop=not a.no_early_stop, candidates=tried)
+    v = replay.verdict(res, tried, {c.id: c.segment for c in parsed.cases},
+                       tuple(a.critical or ()), {c.id: c.weight for c in parsed.cases})
     v.update(baseline=base.label, candidate=label, ungraded=len(parsed.ungraded),
              baseline_endpoint=endpoints.describe(base),
              candidate_endpoint=endpoints.describe(cand))
     print(json.dumps(v, indent=1))
+    _write_receipt(a, v, base.label, label, hashlib.sha256(
+        " ".join(sorted(replay.case_fps(parsed.cases))).encode()).hexdigest()[:16])
+    return 0 if v["promoted"] else 1
+
+
+def _check(a) -> int:
+    from margin_referee import experiments
+    v = experiments.compare(experiments.load(a.baseline), experiments.load(a.candidate),
+                            scorer=a.scorer, threshold=a.threshold, candidates=a.candidates,
+                            critical=tuple(a.critical or ()))
+    v.update(baseline=a.baseline, candidate=a.candidate)
+    print(json.dumps(v, indent=1))
+    _write_receipt(a, v, a.baseline, a.candidate)
+    return 0 if v["promoted"] else 1
+
+
+def _hurdle(a) -> int:
+    from margin_referee import hurdle
+    runs = hurdle.load_runs(a.root)
+    if not runs:
+        print(json.dumps({"error": f"no complete Hurdle runs under {a.root}"}))
+        return 2
+    v = hurdle.compare(runs, by=a.compare, baseline=a.baseline, candidate=a.candidate,
+                       candidates=a.candidates)
+    print(json.dumps(v, indent=1))
+    _write_receipt(a, v, a.baseline, a.candidate)
     return 0 if v["promoted"] else 1
 
 
@@ -79,8 +167,44 @@ def main(argv=None) -> int:
     r.add_argument("--candidate-system", help="test a prompt change: the candidate's system prompt")
     r.add_argument("--candidate-endpoint", help="JSON: a model in your own account")
     r.add_argument("--baseline-endpoint", help="JSON: a model in your own account")
+    r.add_argument("--critical", action="append", metavar="SEGMENT",
+                   help="a segment that is a release criterion (repeatable)")
+    r.add_argument("--repeats", type=int, default=1, choices=range(1, 6), metavar="1-5",
+                   help="run each case this many times per side; a case passes only if every "
+                        "run passed (pass^k). Spend scales with it")
+    r.add_argument("--no-early-stop", action="store_true",
+                   help="run every case even once the answer is already do_not_ship")
+    c = sub.add_parser("check", help="a second opinion on two experiments you already scored "
+                       "(Braintrust export or bt:<experiment id>); runs nothing, spends nothing")
+    c.add_argument("baseline", help="the current model's experiment")
+    c.add_argument("candidate", help="the candidate's experiment")
+    c.add_argument("--scorer", required=True, help="the score that decides pass or fail")
+    c.add_argument("--threshold", type=float, default=1.0, help="a pass is a score >= this")
+    c.add_argument("--candidates", type=int, default=1,
+                   help="how many models were tried on these cases (Loop often tries several)")
+    c.add_argument("--critical", action="append", metavar="SEGMENT",
+                   help="a segment that is a release criterion (repeatable)")
+    h = sub.add_parser("hurdle", help="the verdict on a Hurdle suite you already ran "
+                       "(baseline vs a condition, or one model vs another); runs nothing")
+    h.add_argument("root", help="Hurdle's result store, usually .hurdle")
+    h.add_argument("--compare", choices=("condition", "model"), required=True)
+    h.add_argument("--baseline", required=True, help="the condition id or model you have now")
+    h.add_argument("--candidate", required=True, help="the condition id or model to test")
+    h.add_argument("--candidates", type=int, default=1,
+                   help="how many conditions or models were tried on these tasks")
+    for p in (r, c, h):
+        p.add_argument("--receipt", metavar="OUT.json",
+                       help="also write the verdict as an UNSIGNED receipt (in-toto Statement in "
+                            "a DSSE envelope, assuranceLevel self-run)")
+    vf = sub.add_parser("verify", help="check the signature on a verdict receipt and print the "
+                        "statement inside")
+    vf.add_argument("file", help="the receipt (a DSSE envelope, or a saved Margin response)")
+    key = vf.add_mutually_exclusive_group()
+    key.add_argument("--key", help="the issuer's Ed25519 public key, base64")
+    key.add_argument("--key-url", help="an https URL publishing it as JSON {public_key}")
     a = ap.parse_args(argv)
-    return _fit(a) if a.cmd == "fit" else _replay(a)
+    return {"fit": _fit, "replay": _replay, "check": _check, "hurdle": _hurdle,
+            "verify": _verify}[a.cmd](a)
 
 
 if __name__ == "__main__":
