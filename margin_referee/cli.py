@@ -10,6 +10,11 @@
 OpenAI-compatible endpoint, with your per-token price). ``--candidate-system`` tests a prompt
 change and ``--candidate-tools FILE.json`` a tool change.
 
+A replay that cannot reach a verdict is refused before the full run is paid for: too few cases
+(``--anyway`` runs it as a check that can only find a loss), a smoke case that errors, or an
+estimate over the cap or the key's balance. Exit codes for ``replay``: 0 promote, 1 do not, 2
+no case can be graded, 3 refused before spend.
+
 ``replay``, ``check``, ``hurdle`` and ``ontology-sql`` take ``--receipt out.json`` to write the
 verdict as an UNSIGNED receipt (your own claim, ``assuranceLevel: self-run``). ``verify`` checks
 the signature on a receipt Margin issued.
@@ -121,16 +126,27 @@ def _replay(a) -> int:
                              '[{"type": "function", "function": {"name": ...}}]')
         label += "+tools:" + hashlib.sha256(
             json.dumps(tools, sort_keys=True).encode()).hexdigest()[:10]
-    # counted before the run: an early stop is corrected for every candidate tried
-    tried = replay.record_and_count(parsed.cases, base.label, label)
-    res = replay.run(parsed.cases, endpoints.chat_for(base), endpoints.chat_for(cand),
-                     cap_usd=a.cap, candidate_system=a.candidate_system, repeats=a.repeats,
-                     early_stop=not a.no_early_stop, candidates=tried, candidate_tools=tools)
+    tried = replay.record_and_count(parsed.cases, base.label, label, record=False)
+    floor = stats.gate_floor(tried)
+    if a.anyway or not cases_mod.size_refusal(len(parsed.cases), floor):
+        # counted before the run: an early stop is corrected for every candidate tried
+        replay.record_and_count(parsed.cases, base.label, label)
+    base_chat, cand_chat = endpoints.chat_for(base), endpoints.chat_for(cand)
+    res = cases_mod.checked_run(
+        lambda cs, **kw: replay.run(cs, base_chat, cand_chat, candidate_system=prompt,
+                                    repeats=a.repeats, early_stop=not a.no_early_stop,
+                                    candidates=tried, candidate_tools=tools, **kw),
+        parsed.cases, cap_usd=a.cap, floor=floor, anyway=a.anyway, max_tokens=a.max_tokens,
+        balance=lambda: endpoints.credit_left(base, cand))
     v = replay.verdict(res, tried, {c.id: c.segment for c in parsed.cases},
                        tuple(a.critical or ()), {c.id: c.weight for c in parsed.cases})
     v.update(baseline=base.label, candidate=label, ungraded=len(parsed.ungraded),
              baseline_endpoint=endpoints.describe(base),
              candidate_endpoint=endpoints.describe(cand))
+    if res.refused:  # the reason first; no receipt, because nothing was judged
+        print(f"refused before spend: {res.refused}", file=sys.stderr)
+        print(json.dumps(v, indent=1))
+        return 3
     print(json.dumps(v, indent=1))
     _write_receipt(a, v, base.label, label, hashlib.sha256(
         " ".join(sorted(replay.case_fps(parsed.cases))).encode()).hexdigest()[:16])
@@ -166,7 +182,8 @@ def _ontology_sql(a) -> int:
     try:
         v = ontology_sql.compare(a.run_dir, baseline_arm=a.baseline_arm,
                                  candidate_arm=a.candidate_arm, price_in=a.price_in,
-                                 price_out=a.price_out, candidates=a.candidates,
+                                 price_out=a.price_out, price_cached=a.price_cached,
+                                 candidates=a.candidates,
                                  segment_by=a.segment_by, critical=tuple(a.critical or ()))
     except ValueError as exc:
         raise SystemExit(str(exc))
@@ -194,6 +211,11 @@ def _ontology_sql(a) -> int:
                 f"{a.baseline_arm} ${v['baseline_cost_per_case']:.5f}, {a.candidate_arm} "
                 f"${v['candidate_cost_per_case']:.5f} ({v['cost_basis']})"
                 if v["baseline_cost_per_case"] is not None else v["cost_basis"]),
+            "  cache-hit share of input: " + ", ".join(
+                f"{arm} " + (f"{v['cache'][side]['share']:.0%}" if v["cache"][side]
+                             else "cache split not recorded")
+                for side, arm in (("baseline", a.baseline_arm), ("candidate", a.candidate_arm))),
+            *([f"  {v['cache']['line']}"] if v["cache"]["line"] else []),
             *(f"  {s['segment']}: {s['cases']} questions, won {s['won']}, lost {s['lost']}"
               + (", worse" if s["worse"] else "") for s in v["segments"])]))
     _write_receipt(a, v, a.baseline_arm, a.candidate_arm)
@@ -207,7 +229,10 @@ def main(argv=None) -> int:
     f.add_argument("file")
     f.add_argument("--baseline-rate", type=float, default=stats.DEFAULT_BASELINE_RATE)
     f.add_argument("--candidates", type=int, default=1)
-    r = sub.add_parser("replay", help="run both models on the cases and get the verdict")
+    r = sub.add_parser("replay", help="run both models on the cases and get the verdict",
+                       epilog="exit codes: 0 promote, 1 do not promote, 2 no case can be "
+                              "graded, 3 refused before spend (too few cases, a smoke case "
+                              "that errors, or an estimate over the cap or the key's balance)")
     r.add_argument("file")
     r.add_argument("--baseline", default="")
     r.add_argument("--candidate", default="")
@@ -223,6 +248,11 @@ def main(argv=None) -> int:
     r.add_argument("--repeats", type=int, default=1, choices=range(1, 6), metavar="1-5",
                    help="run each case this many times per side; a case passes only if every "
                         "run passed (pass^k). Spend scales with it")
+    r.add_argument("--anyway", action="store_true",
+                   help="run a set too small to prove a change; it can only find a loss")
+    r.add_argument("--max-tokens", type=int, default=8192,
+                   help="the output limit per call (a case's own wins); a cut-off answer is "
+                        "retried once at double, up to 32768")
     r.add_argument("--no-early-stop", action="store_true",
                    help="run every case even once the answer is already do_not_ship")
     c = sub.add_parser("check", help="a second opinion on two experiments you already scored "
@@ -252,6 +282,9 @@ def main(argv=None) -> int:
                    help="the arm to judge (treatment is the ontology arm; ontology also works)")
     o.add_argument("--price-in", type=float, help="USD per million input tokens")
     o.add_argument("--price-out", type=float, help="USD per million output tokens")
+    o.add_argument("--price-cached", type=float,
+                   help="USD per million cached input tokens (without it, cached input is "
+                   "priced as fresh)")
     o.add_argument("--segment-by", default="auto",
                    choices=("auto", "difficulty", "db_id", "dataset", "none"),
                    help="the row field to read each segment on (auto: difficulty, else db_id)")

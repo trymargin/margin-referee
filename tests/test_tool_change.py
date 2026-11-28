@@ -81,7 +81,7 @@ def test_an_unreadable_tool_call_is_unanswered_and_promotes_nothing(calls):
 
 def test_the_cli_replays_the_committed_example_with_its_candidate_tools(monkeypatch, capsys):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-not-a-real-key")
-    monkeypatch.setattr(replay, "record_and_count", lambda cases, base, label: 1)
+    monkeypatch.setattr(replay, "record_and_count", lambda cases, base, label, **kw: 1)
     new = json.loads((EXAMPLE / "candidate_tools.json").read_text())
     sides = iter(("baseline", "candidate"))
 
@@ -100,7 +100,7 @@ def test_the_cli_replays_the_committed_example_with_its_candidate_tools(monkeypa
         return chat
     monkeypatch.setattr(endpoints, "chat_for", chat_for)
     code = cli.main(["replay", str(EXAMPLE / "cases.jsonl"), "--baseline", "m/x",
-                     "--candidate", "m/x", "--cap", "1",
+                     "--candidate", "m/x", "--cap", "1", "--anyway",
                      "--candidate-tools", str(EXAMPLE / "candidate_tools.json")])
     v = json.loads(capsys.readouterr().out)
     assert (v["cases"], v["baseline_passed"], v["candidate_passed"]) == (3, 0, 3)

@@ -6,7 +6,7 @@ verifier and prints the difference. It does not say whether the difference is re
 second arm cost. This reads the files the run wrote and answers both, without calling a model:
 
     margin-referee ontology-sql runs
-    margin-referee ontology-sql runs/full_20261126 --price-in 5 --price-out 25
+    margin-referee ontology-sql runs/full_20261126 --price-in 5 --price-out 25 --price-cached 0.5
 
 File layout and field names were read from NVIDIA/ontology-sql-eval at commit 871bb924
 (2026-11-26), through the GitHub API; nothing of theirs was installed or run:
@@ -32,12 +32,22 @@ The rules, which are the referee's and deliberately not NVIDIA's:
 * With repeats, a question passes only if every repeat passed.
 * Tokens come from the ``ng_model_call_capture`` block Gym attaches to each row when the run had
   capture on (every call the arm made), else from the treatment row's ``agent_*`` totals.
-  ponytail: the block's shape is from NeMo Gym's own doc page, not from a real run's file; the
-  raw ``model_call_capture/<rollout>.capture.jsonl`` files are not read, since the block is
-  their summary.
+  The raw ``model_call_capture/<rollout>.capture.jsonl`` files are not read, since the block
+  is their summary.
+* Cached input is read per call from ``ng_model_call_capture.calls[].cached_tokens``, else from
+  the treatment row's ``agent_cached_input_tokens``. Both names were read from a real run's
+  files (871bb924 on WideWorldImporters, 2026-11-27: ``treatment/wideworldimporters.jsonl``,
+  where 2,233,141 of 2,742,340 input tokens were cached; the raw capture files carry the same
+  count at ``response.usage.input_tokens_details.cached_tokens``). Cached tokens are part of
+  the input count, not extra. A row that carries no cached count leaves the split
+  ``not recorded``; none is guessed, and zero is only what a file says is zero.
 * Cost is tokens times the ``--price-in`` / ``--price-out`` you give, per million tokens, one
-  rate for every call, cached input priced as fresh. Without both prices cost is not recorded:
-  the files carry no price and none is guessed.
+  rate for every call. With ``--price-cached`` and a recorded split, cached input is priced at
+  that rate; otherwise cached input is priced as fresh and the cost basis says so. Without
+  ``--price-in`` and ``--price-out`` cost is not recorded: the files carry no price and none
+  is guessed.
+* The cache-hit share (cached input over all input) is printed per arm, with a line when the
+  two arms differ by ten points or more. It never moves the quality verdict.
 * An added layer that is not shown to be cheaper has to earn its place: when the pass rate
   merely holds, the verdict is ``not_enough_evidence``. A proven gain reads
   ``ship_if_worth_the_cost``. The 0.97 bar and the case floor are the referee's, unchanged.
@@ -124,10 +134,12 @@ def outcome(row: dict) -> tuple[Optional[float], str]:
                   else f"an unrecognised failure reason ({reason})")
 
 
-def tokens(row: dict) -> Optional[tuple[float, float, bool, set]]:
-    """``(input, output, is_a_floor, models)`` for one row, or None when it carries no counts.
-    Input is total minus output where the provider gave a total: Gym's ``tokens_in`` counts a
-    cache write twice on some gateways (``ontology_sql_eval/gym/model_routing.py``)."""
+def tokens(row: dict) -> Optional[tuple[float, float, bool, set, Optional[float]]]:
+    """``(input, output, is_a_floor, models, cached_input)`` for one row, or None when it
+    carries no counts. Input is total minus output where the provider gave a total: Gym's
+    ``tokens_in`` counts a cache write twice on some gateways
+    (``ontology_sql_eval/gym/model_routing.py``). ``cached_input`` is the part of the input a
+    cache served, and None when any call lacks the count: the split is then not recorded."""
     def inp(c):
         t, o = c.get("tokens_total"), c.get("tokens_out")
         return t - o if _num(t) and _num(o) else c.get("tokens_in")
@@ -140,12 +152,16 @@ def tokens(row: dict) -> Optional[tuple[float, float, bool, set]]:
         pairs = [(inp(c), c.get("tokens_out")) for c in calls]
         if not any(_num(i) or _num(o) for i, o in pairs):
             return None
+        cached = [c.get("cached_tokens") for c in calls]
         return (sum(i for i, _ in pairs if _num(i)), sum(o for _, o in pairs if _num(o)),
                 bool(cap.get("gaps")) or any(not (_num(i) and _num(o)) for i, o in pairs),
-                {str(c["model"]) for c in calls if c.get("model")})
+                {str(c["model"]) for c in calls if c.get("model")},
+                sum(cached) if all(_num(x) for x in cached) else None)
     i, o = row.get("agent_input_tokens"), row.get("agent_output_tokens")
     if _num(i) and _num(o):
-        return i, o, bool(row.get("agent_llm_calls_without_usage")), set()
+        cached = row.get("agent_cached_input_tokens")
+        return (i, o, bool(row.get("agent_llm_calls_without_usage")), set(),
+                cached if _num(cached) else None)
     return None
 
 
@@ -160,13 +176,17 @@ def _segment(rows_by_arm: list, by: str) -> dict:
 
 def compare(run_dir: str, *, baseline_arm: str = "control", candidate_arm: str = "treatment",
             price_in: Optional[float] = None, price_out: Optional[float] = None,
-            candidates: int = 1, segment_by: str = "auto", critical: tuple = ()) -> dict:
+            price_cached: Optional[float] = None, candidates: int = 1,
+            segment_by: str = "auto", critical: tuple = ()) -> dict:
     if (price_in is None) != (price_out is None):
         raise ValueError("give both --price-in and --price-out, or neither")
+    if price_cached is not None and price_in is None:
+        raise ValueError("--price-cached needs --price-in and --price-out")
     arms = {"baseline": load_arm(run_dir, baseline_arm),
             "candidate": load_arm(run_dir, candidate_arm)}
     res = replay.Result()
-    used = {s: {"in": 0.0, "out": 0.0, "floor": False, "models": set()} for s in arms}
+    used = {s: {"in": 0.0, "out": 0.0, "cached": 0.0, "split": True, "floor": False,
+                "models": set()} for s in arms}
     counted = True
     for k in sorted(set().union(*(a["rows"].keys() | a["dispatched"] for a in arms.values()))):
         score, why = {}, None
@@ -195,12 +215,22 @@ def compare(run_dir: str, *, baseline_arm: str = "control", candidate_arm: str =
             u["in"] += sum(t[0] for t in got) / len(got)
             u["out"] += sum(t[1] for t in got) / len(got)
             u["floor"] = u["floor"] or any(t[2] for t in got)
+            if any(t[4] is None for t in got):
+                u["split"] = False
+            else:  # cached is part of the input, so it can never exceed it
+                u["cached"] += sum(min(t[4], t[0]) for t in got) / len(got)
             u["models"] |= set().union(*(t[3] for t in got))
     n = len(res.pairs)
     priced = counted and price_in is not None and n > 0
+    # one arm priced with its cache and the other without would bias the comparison, so the
+    # cached rate applies only when both arms recorded the split
+    split = counted and n > 0 and all(u["split"] for u in used.values())
+    cache_priced = priced and split and price_cached is not None
     if priced:
         for side, u in used.items():
-            res.cost[side] = (u["in"] * price_in + u["out"] * price_out) / 1e6
+            cached = u["cached"] if cache_priced else 0.0
+            res.cost[side] = ((u["in"] - cached) * price_in + cached * (price_cached or 0.0)
+                              + u["out"] * price_out) / 1e6
     seg = _segment([a["rows"] for a in arms.values()], segment_by)
     v = replay.verdict(res, candidates, seg["of"], tuple(critical))
     if not priced:
@@ -238,10 +268,23 @@ def compare(run_dir: str, *, baseline_arm: str = "control", candidate_arm: str =
             v["why"] = (f"the pass rate holds but no gain is proven ({v['gain']['line']}), and "
                         f"the candidate arm {spend}: an added layer that is not cheaper is "
                         "worth shipping only on a proven gain")
+    cache = {s: ({"fresh_in": round(u["in"] - u["cached"], 1), "cached_in": round(u["cached"], 1),
+                  "share": round(u["cached"] / u["in"], 4)}
+                 if counted and n and u["split"] and u["in"] > 0 else None)
+             for s, u in used.items()}
+    cache["line"] = None
+    if cache["baseline"] and cache["candidate"]:
+        was, now = cache["baseline"]["share"], cache["candidate"]["share"]
+        if abs(now - was) >= 0.10:
+            cache["line"] = (f"the candidate's cache-hit share {'fell' if now < was else 'rose'} "
+                             f"from {was:.0%} to {now:.0%}")
     v.update(baseline=baseline_arm, candidate=candidate_arm, spend_usd=0.0, tokens=per,
-             token_ratio=ratio, segment_by=seg["by"],
-             cost_basis=("tokens times the prices given, one rate for every call, cached input "
-                         "priced as fresh" if priced else
+             token_ratio=ratio, segment_by=seg["by"], cache=cache,
+             cost_basis=("tokens times the prices given, one rate for every call, "
+                         + ("cached input at the cached rate" if cache_priced else
+                            "cached input priced as fresh: pass --price-cached" if split else
+                            "cache split not recorded, so all input is priced as fresh")
+                         if priced else
                          "not recorded: these files carry no price; pass --price-in and "
                          "--price-out (USD per million tokens) to compute one"
                          if counted and n else

@@ -8,8 +8,9 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field, replace
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 #: A free-text expected answer longer than this is a judgement, not a label: never compared exactly.
 LABEL_MAX_CHARS = 80
@@ -462,4 +463,183 @@ def apply_extras(v: dict, early: Optional[dict], k: int, reliability: Optional[d
     if weighted and weighted["worse_traffic_share"] > 0:
         v["why"] += (f"; {weighted['summary']} (a weighting of the same cases; the decision is "
                      "on the unweighted paired test)")
+    return v
+
+
+#: The decision of a run the preflight refused: the full run was never paid for.
+REFUSED = "refused_before_spend"
+#: Cases run on both sides before the full run, to catch a broken call for cents.
+SMOKE_CASES = 2
+#: A cut-off answer is retried once at double the output limit, never past this.
+MAX_TOKENS_CEILING = 32768
+#: The full run is estimated from the smoke cases with this much room.
+BUDGET_MARGIN = 1.2
+#: How ``stopped`` begins when a replay gave up mid-run because it could no longer decide.
+GAVE_UP = "stopped after "
+_HTTP_STATUS = re.compile(r"HTTP(?: Error)? (\d{3})")
+_TRANSIENT = ("timeout", "timed out", "connection reset", "connectionreset",
+              "remote end closed", "temporarily unavailable")
+
+
+def error_kind(why) -> str:
+    """How a replay acts on a call that got no answer: ``cut_off`` (the output limit: one retry
+    at a higher limit), ``credit`` (HTTP 402 or a spent key: every later call fails the same
+    way, so the run stops), ``transient`` (429, 5xx, a timeout, a dropped connection: one
+    retry) or ``fatal`` (anything else, such as a 404 or a rejected schema: it fails again)."""
+    low = str(why).lower()
+    if "cut off by the output limit" in low or low.startswith("truncated at"):
+        return "cut_off"
+    m = _HTTP_STATUS.search(str(why))
+    code = int(m.group(1)) if m else 0
+    if code == 402 or "hit its limit" in low:
+        return "credit"
+    if code == 429 or 500 <= code <= 599:
+        return "transient"
+    if code:
+        return "fatal"
+    return "transient" if any(w in low for w in _TRANSIENT) else "fatal"
+
+
+def retries(unanswered: list, max_tokens: int) -> list:
+    """``(unanswered entry, output limit)`` for each case worth one more try when the run ends:
+    a transient error at the same limit, a cut-off answer at double the limit (never past
+    ``MAX_TOKENS_CEILING``). A 402, any other 4xx and a failed check are not retried."""
+    up = min(2 * max_tokens, MAX_TOKENS_CEILING)
+    out = []
+    for u in unanswered:
+        kind = error_kind(u[-1])
+        if kind == "transient":
+            out.append((u, max_tokens))
+        elif kind == "cut_off" and up > max_tokens:
+            out.append((u, up))
+    return out
+
+
+def stop_reason(unanswered: list, done: int, total: int, floor: Optional[int],
+                max_tokens: int) -> str:
+    """Why a replay should stop spending after ``done`` of ``total`` cases ('' to go on).
+
+    Out of credit: every later call would fail the same way. Or futile: the cases answered,
+    the ones still worth a retry and the ones not yet run no longer reach the gate's
+    ``floor``, so nothing later could make the verdict ship. ``floor`` None turns the second
+    off (a run that was never size-checked, or one that can only find a loss)."""
+    if done >= total:
+        return ""
+    credit = next((str(u[-1]) for u in unanswered if error_kind(u[-1]) == "credit"), "")
+    if credit:
+        return f"{GAVE_UP}{done} of {total} cases: out of credit ({credit[:120]})"
+    can = done - len(unanswered) + len(retries(unanswered, max_tokens)) + total - done
+    if floor is None or can >= floor:
+        return ""
+    top = Counter(str(u[-1])[:120] for u in unanswered).most_common(1)
+    return (f"{GAVE_UP}{done} of {total} cases: {len(unanswered)} got no gradable answer"
+            f"{f' (most: {top[0][0]})' if top else ''}, so at most {can} can still be judged "
+            f"and the gate needs {floor}")
+
+
+def _usd(x: float) -> str:
+    """Dollars to the cent, or to as many places as a sub-cent amount needs (up to six)."""
+    whole, _, frac = f"{x:.6f}".rstrip("0").partition(".")
+    return f"${whole}.{frac.ljust(2, '0')}"
+
+
+def size_refusal(n: int, floor: int) -> str:
+    """Why ``n`` gradable cases cannot end in ship ('' when they can). ``floor`` is the gate's
+    own ``cases_needed`` for the candidates tried; the verdict never says ship below it."""
+    if n >= floor:
+        return ""
+    return (f"{n} gradable case(s) cannot prove this change: the gate needs {floor} for the "
+            "candidates tried on them, so even a candidate that passed every case would end in "
+            f"not_enough_evidence. Add {floor - n} more")
+
+
+def smoke_refusal(unanswered: list, stopped: str, max_tokens: int) -> str:
+    """Why the smoke cases stop the replay ('' when every one got a gradable answer)."""
+    if not unanswered:
+        return f"the smoke run {stopped}" if stopped else ""
+    cid, who, why = unanswered[0][0], unanswered[0][1], str(unanswered[0][-1])
+    if error_kind(why) == "cut_off":
+        return (f"smoke case {cid} ({who}) was cut off by the output limit, also after one "
+                f"retry at up to {max_tokens} output tokens; raise the limit (a case's own "
+                "max_tokens wins over the run's) or shorten the task")
+    return f"smoke case {cid} ({who}) got no answer: {why}"
+
+
+def checked_run(run: Callable, cases: list, *, cap_usd: float, floor: int,
+                anyway: bool = False, balance: Optional[Callable] = None,
+                show_balance: bool = True, max_tokens: int = 8192):
+    """Can this replay reach a verdict? Asked before the full run is paid for (2026-11-27,
+    after five paid runs in one week ended ``not_enough_evidence`` for a reason knowable first).
+
+    ``run(cases, cap_usd=, max_tokens=, seed=, floor=)`` is the replay itself. In order:
+
+    * size (free): fewer cases than ``floor`` can never end in ship, so the run is refused
+      unless ``anyway``, which runs it as a check that can only find a loss.
+    * smoke (cents): the first ``SMOKE_CASES`` cases on both sides. A case still unanswered
+      after the run's own one retry refuses the rest, with the exact error.
+    * budget: the smoke cases' mean cost times every case, plus ``BUDGET_MARGIN``, against the
+      cap and against ``balance()`` (what the key can still spend; None is no limit; an error
+      is "balance not checked" and never blocks).
+
+    The result carries ``preflight`` and, when refused, ``refused`` (the reason). The smoke
+    cases are the first cases of the full run, so a run that goes ahead pays for nothing twice.
+    """
+    n = len(cases)
+    pf = {"size": "ok", "smoke": "skipped", "budget": "unchecked", "estimate_usd": None,
+          "balance_usd": None, "max_tokens": max_tokens}
+
+    def done(res, stage="", why=""):
+        if stage:
+            pf[stage], res.refused = "refused", why
+        pf["max_tokens"], res.preflight = max(max_tokens, res.max_tokens), pf
+        return res
+    small = size_refusal(n, floor)
+    if small and not anyway:
+        return done(run([], cap_usd=cap_usd, max_tokens=max_tokens), "size", small)
+    if small:
+        pf["size"] = "overridden"
+        pf["note"] = (f"{n} case(s) are fewer than the {floor} the gate needs: this run can "
+                      "only find a loss, it can never say ship")
+    smoke = run(cases[:SMOKE_CASES], cap_usd=cap_usd, max_tokens=max_tokens)
+    spent = f"; {_usd(smoke.spend_usd)} spent"
+    why = smoke_refusal(smoke.unanswered, smoke.stopped, smoke.max_tokens)
+    if why:
+        return done(smoke, "smoke", why + spent)
+    pf["smoke"] = "ok"
+    est = smoke.answered_usd / max(1, min(n, SMOKE_CASES)) * n * BUDGET_MARGIN
+    pf["estimate_usd"] = round(est, 6)
+    if est > cap_usd:
+        return done(smoke, "budget", f"the full run is estimated at {_usd(est)} ({n} cases "
+                    f"at the smoke cases' mean cost, plus {BUDGET_MARGIN - 1:.0%}) and the cap "
+                    f"is {_usd(cap_usd)}: raise the cap to about {_usd(est)} or run fewer cases"
+                    + spent)
+    if balance is not None:
+        try:
+            left = balance()
+        except Exception:  # noqa: BLE001 - a balance that cannot be read never blocks a run
+            left, pf["balance_note"] = None, "balance not checked"
+        else:
+            pf["balance_note"] = "no limit to read on this key" if left is None else "checked"
+        if left is not None:
+            pf["balance_usd"] = round(left, 4) if show_balance else None
+            if est > left:
+                has = f"the key has {_usd(left)} left" if show_balance else \
+                    "the model account behind this replay cannot cover it right now"
+                return done(smoke, "budget", f"the full run is estimated at {_usd(est)} and "
+                            f"{has}: add credit or raise the key's limit" + spent)
+    pf["budget"] = "ok"
+    return done(run(cases, cap_usd=cap_usd, max_tokens=smoke.max_tokens, seed=smoke,
+                    floor=None if small else floor))
+
+
+def apply_preflight(v: dict, preflight: Optional[dict], refused: str) -> dict:
+    """Put the preflight on a verdict (None for a run nobody preflighted). A refused run has
+    one decision, ``refused_before_spend``: it is not a reading of the change and it never
+    ships. A run that gave up mid-run says why it stopped, not what the partial pairs show."""
+    v["preflight"] = preflight
+    if refused:
+        v.update(decision=REFUSED, quality="unclear", promoted=False, why=refused)
+    elif str(v.get("stopped") or "").startswith(GAVE_UP) \
+            and v["decision"] == "not_enough_evidence":
+        v["why"] = v["stopped"]
     return v

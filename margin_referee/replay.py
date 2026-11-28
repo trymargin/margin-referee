@@ -20,9 +20,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from margin_referee import stats
-from margin_referee.cases import (MIN_EARLY_STOP_CASES, Case, apply_extras, grade,
-                                  planned_looks, reliability_terms, stop_early,
-                                  weighted_terms)
+from margin_referee.cases import (MIN_EARLY_STOP_CASES, Case, apply_extras, apply_preflight,
+                                  grade, planned_looks, reliability_terms, retries,
+                                  stop_early, stop_reason, weighted_terms)
 
 LEDGER = pathlib.Path(os.environ.get("MARGIN_REFEREE_LEDGER",
                                      pathlib.Path.home() / ".margin-referee" / "ledger.json"))
@@ -41,6 +41,13 @@ class Result:
     #: Set when the replay stopped because the answer was already ``do_not_ship``: a deliberate
     #: stop, not a failure, so ``stopped`` stays empty.
     stopped_early: Optional[dict] = None
+    #: Set by ``cases.checked_run``: what the preflight found, and why it refused the run.
+    preflight: Optional[dict] = None
+    refused: str = ""
+    #: The highest output limit a call was sent with (a cut-off answer is retried at double).
+    max_tokens: int = 0
+    #: Spend on the cases both sides answered: what the budget estimate is made from.
+    answered_usd: float = 0.0
 
 
 def with_system(messages: list, system: Optional[str]) -> list:
@@ -91,7 +98,8 @@ def _side(case: Case, side: str, chat: Callable, system: Optional[str], max_toke
 def run(cases: list, baseline_chat: Callable, candidate_chat: Callable, *, cap_usd: float,
         candidate_system: Optional[str] = None, max_tokens: int = 8192,
         workers: int = 8, repeats: int = 1, early_stop: bool = True,
-        candidates: int = 1, candidate_tools: Optional[list] = None) -> Result:
+        candidates: int = 1, candidate_tools: Optional[list] = None,
+        seed: Optional[Result] = None, floor: Optional[int] = None) -> Result:
     """Both sides on every case until the next batch could cross ``cap_usd``.
 
     ``repeats`` runs each case that many times per side (spend scales with it; the cap prices a
@@ -99,18 +107,43 @@ def run(cases: list, baseline_chat: Callable, candidate_chat: Callable, *, cap_u
     have both sides the replay stops as soon as the answer is already ``do_not_ship``, at a z
     corrected for the planned looks and the ``candidates`` tried; it never stops early for
     ship. ``candidate_tools`` is a tool change: the candidate is offered that tool list in
-    place of each case's own, and the baseline keeps the case's tools."""
-    out, worst, i = Result(), 0.0, 0
+    place of each case's own, and the baseline keeps the case's tools.
+
+    The run guards its own spend (2026-11-27). A 402 stops it at once: every later call would
+    fail the same way. With ``floor`` (the gate's ``cases_needed``, from ``cases.checked_run``)
+    it stops as soon as the cases that can still be answered no longer reach it. When it ends,
+    each case left unanswered by a transient error, or by the output limit, is tried once more
+    (``cases.retries``). ``seed`` is a result to continue from: the smoke cases, already run."""
+    out = seed or Result()
+    out.max_tokens = max(out.max_tokens, max_tokens)
+    i = start = len(out.pairs) + len(out.unanswered)
+    worst = out.spend_usd / i if i else 0.0
     looks, looked = planned_looks(len(cases), workers), 0
 
     def bound(ps, family):
         return stats.paired_bound(ps, z=stats.family_z(family))
 
-    def pair(case):
-        b = _side(case, "baseline", baseline_chat, None, max_tokens, repeats)
-        c = _side(case, "candidate", candidate_chat, candidate_system, max_tokens, repeats,
+    def pair(case, limit=max_tokens):
+        b = _side(case, "baseline", baseline_chat, None, limit, repeats)
+        c = _side(case, "candidate", candidate_chat, candidate_system, limit, repeats,
                   candidate_tools)
         return case, b, c
+
+    def take(case, b, c):
+        """Fold one case in: its unanswered entry, or None when both sides answered."""
+        nonlocal worst
+        (bs, bc, bt, be, br), (cs, cc, ct, cerr, cr) = b, c
+        out.spend_usd += bt + ct
+        worst = max(worst, bt + ct)
+        if be or cerr:
+            return (case.id, "baseline" if be else "candidate", be or cerr)
+        out.answered_usd += bt + ct
+        out.cost["baseline"] += bc
+        out.cost["candidate"] += cc
+        out.pairs.append((case.id, bs, cs))
+        if repeats > 1:
+            out.runs[case.id] = {"baseline": br, "candidate": cr}
+        return None
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         while i < len(cases):
             room = cap_usd - out.spend_usd
@@ -118,21 +151,16 @@ def run(cases: list, baseline_chat: Callable, candidate_chat: Callable, *, cap_u
             if size < 1 or room <= 0:
                 out.stopped = f"stopped at the ${cap_usd:.2f} cap after {i} cases"
                 break
+            if seed is not None and i == start:  # end where an unseeded run's batch would
+                size = min(size, (1 - i) % workers or workers)
             batch = cases[i:i + (1 if worst == 0 else size)]
-            for case, (bs, bc, bt, be, br), (cs, cc, ct, cerr, cr) in pool.map(pair, batch):
-                spent = bt + ct
-                out.spend_usd += spent
-                worst = max(worst, spent)
-                if be or cerr:
-                    out.unanswered.append((case.id, "baseline" if be else "candidate",
-                                           be or cerr))
-                    continue
-                out.cost["baseline"] += bc
-                out.cost["candidate"] += cc
-                out.pairs.append((case.id, bs, cs))
-                if repeats > 1:
-                    out.runs[case.id] = {"baseline": br, "candidate": cr}
+            for case, b, c in pool.map(pair, batch):
+                if (u := take(case, b, c)) is not None:
+                    out.unanswered.append(u)
             i += len(batch)
+            out.stopped = stop_reason(out.unanswered, i, len(cases), floor, max_tokens)
+            if out.stopped:
+                break
             # never more looks than the test was corrected for (a tight cap shrinks batches)
             if early_stop and looked < looks and len(out.pairs) >= MIN_EARLY_STOP_CASES:
                 looked += 1
@@ -140,6 +168,15 @@ def run(cases: list, baseline_chat: Callable, candidate_chat: Callable, *, cap_u
                                                len(out.unanswered))
                 if out.stopped_early:
                     break
+        again = [] if out.stopped or out.stopped_early else retries(out.unanswered, max_tokens)
+        if worst:  # only the retries the cap still has room for
+            again = again[:max(0, int((cap_usd - out.spend_usd) // worst))]
+        by_id = {c.id: c for c in cases}
+        for (u, limit), (case, b, c) in zip(again, pool.map(
+                lambda a: pair(by_id[a[0][0]], a[1]), again)):
+            out.max_tokens = max(out.max_tokens, limit)
+            if take(case, b, c) is None:  # a second failure keeps the first one's reason
+                out.unanswered.remove(u)
     return out
 
 
@@ -149,9 +186,10 @@ def case_fps(cases: list) -> set:
 
 
 def record_and_count(cases: list, baseline: str, candidate: str,
-                     ledger: pathlib.Path = LEDGER) -> int:
+                     ledger: pathlib.Path = LEDGER, *, record: bool = True) -> int:
     """Remember this candidate and return how many distinct candidates were tried against
-    ``baseline`` on these cases or a set sharing ``OVERLAP`` of them (this one included)."""
+    ``baseline`` on these cases or a set sharing ``OVERLAP`` of them (this one included).
+    ``record=False`` only counts: a run refused for its size never ran, so it is not a try."""
     mine = case_fps(cases)
     try:
         rows = json.loads(ledger.read_text())
@@ -160,9 +198,10 @@ def record_and_count(cases: list, baseline: str, candidate: str,
     need = max(1, int(OVERLAP * len(mine)))
     tried = {r["candidate"] for r in rows if r.get("baseline") == baseline
              and len(mine & set(r.get("cases", []))) >= need}
-    rows.append({"baseline": baseline, "candidate": candidate, "cases": sorted(mine)})
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger.write_text(json.dumps(rows))
+    if record:
+        rows.append({"baseline": baseline, "candidate": candidate, "cases": sorted(mine)})
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(json.dumps(rows))
     return len(tried | {candidate})
 
 
@@ -342,5 +381,6 @@ def verdict(res: Result, candidates: int = 1, seg_of: Optional[dict] = None,
         res.pairs, seg_of or {},
         lambda ps, kk: stats.paired_bound(ps, z=stats.family_z(kk * looks)),
         k, complete, critical, stats.gate_floor))
-    return apply_extras(outv, early, k, reliability_terms(res.runs, repeats),
-                        weighted_terms(res.pairs, weight_of or {}))
+    return apply_preflight(apply_extras(outv, early, k, reliability_terms(res.runs, repeats),
+                                        weighted_terms(res.pairs, weight_of or {})),
+                           res.preflight, res.refused)

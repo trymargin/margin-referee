@@ -199,6 +199,31 @@ def chat_for(ep: Endpoint):
     return chat
 
 
+def _get(url: str, headers: dict) -> dict:
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r).get("data") or {}
+
+
+def credit_left(*eps: Optional[Endpoint]) -> Optional[float]:
+    """What the OpenRouter key(s) behind these endpoints can still spend, in USD: the lower of
+    the key's own ``limit_remaining`` (GET /api/v1/key) and the account's credit (GET
+    /api/v1/credits, when the key may read it). None when there is nothing to read: no
+    OpenRouter endpoint, or a key with no limit on an account whose credit it cannot see.
+    Raises when OpenRouter cannot be asked; the caller reports "balance not checked"."""
+    left = []
+    for headers in {tuple(e.headers.items()) for e in eps if e and e.kind == "openrouter"}:
+        key = _get("https://openrouter.ai/api/v1/key", dict(headers))
+        if key.get("limit_remaining") is not None:
+            left.append(float(key["limit_remaining"]))
+        try:
+            c = _get("https://openrouter.ai/api/v1/credits", dict(headers))
+            left.append(float(c["total_credits"]) - float(c["total_usage"]))
+        except Exception:  # noqa: BLE001, S110 - not every key may read the account's credit
+            pass
+    return min(left) if left else None
+
+
 def describe(ep: Optional[Endpoint]) -> Optional[dict]:
     """What a verdict may say about the endpoint (never the credential)."""
     if ep is None:

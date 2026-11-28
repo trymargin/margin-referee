@@ -15,6 +15,14 @@ was installed or run, and no row here is copied from a real run: the values are 
 * ``ng_model_call_capture``: ``scripts/run_gym_arm.sh`` says Gym attaches it to each rollout row;
   its shape is from NVIDIA-NeMo/Gym at 5d6429f5 (the commit ontology-sql-eval pins),
   ``fern/versions/latest/pages/model-server/model-call-capture.mdx``
+* cached input: the field names are from a real run's files (871bb924 on WideWorldImporters,
+  2026-11-27, ``deepseek/deepseek-v4.1-flash``): each call in
+  ``treatment/wideworldimporters.jsonl``'s ``ng_model_call_capture.calls`` carries
+  ``cached_tokens`` (a part of ``tokens_in``, beside ``cache_hit`` and
+  ``cache_creation_tokens``), the block's ``metrics`` carries their sum, and the treatment row
+  carries ``agent_cached_input_tokens``. The raw
+  ``treatment/model_call_capture/<rollout>.capture.jsonl`` lines hold the same count at
+  ``response.usage.input_tokens_details.cached_tokens``. The values below are still made up.
 """
 import json
 
@@ -24,15 +32,19 @@ from margin_referee import cli, ontology_sql
 
 
 def capture(calls):
-    """Gym's per-row block: ``calls`` is ``[(tokens_in, tokens_out, tokens_total)]``."""
+    """Gym's per-row block: ``calls`` is ``[(tokens_in, tokens_out, tokens_total)]``, with an
+    optional fourth ``cached_tokens``; a call given without one carries no cached count."""
     return {"rollout_id": "0-0",
             "metrics": {"tokens_in": sum(c[0] or 0 for c in calls),
                         "tokens_out": sum(c[1] or 0 for c in calls), "num_calls": len(calls)},
             "calls": [{"model_call_id": f"c{n}", "call_index": n,
                        "model_ref": {"type": "responses_api_models", "name": "policy_model"},
                        "model": "azure/anthropic/claude-opus-5-5", "dialect": "responses",
-                       "status_code": 200, "tokens_in": i, "tokens_out": o, "tokens_total": t}
-                      for n, (i, o, t) in enumerate(calls)]}
+                       "status_code": 200, "tokens_in": c[0], "tokens_out": c[1],
+                       "tokens_total": c[2],
+                       **({"cache_hit": c[3] > 0, "cached_tokens": c[3],
+                           "cache_creation_tokens": 0} if len(c) > 3 else {})}
+                      for n, c in enumerate(calls)]}
 
 
 def control_row(i, ok, reason=None, calls=((2700, 500, 3200),), **extra):
@@ -166,6 +178,86 @@ def test_a_call_with_no_usage_marks_the_total_a_floor():
     assert ontology_sql.tokens(treatment_row(0, True, agent_llm_calls_without_usage=2))[2] is True
 
 
+COLD = ((14000, 800, 14800, 0),)                          # one call, nothing cached
+WARM = ((100, 600, 700, 0), (20000, 400, 20400, 14000), (30000, 500, 30500, 26000))
+
+
+def cache_run(tmp_path, control_calls=COLD, treatment_calls=WARM, n=4, **kw):
+    return ontology_sql.compare(write_run(
+        tmp_path, [control_row(i, True, calls=control_calls) for i in range(n)],
+        [treatment_row(i, True, calls=treatment_calls) for i in range(n)]), **kw)
+
+
+def test_cached_input_is_summed_per_arm_from_each_call(tmp_path):
+    assert ontology_sql.tokens(treatment_row(0, True, calls=WARM))[4] == 40000
+    assert ontology_sql.tokens(treatment_row(0, True))[4] == 9000  # agent_cached_input_tokens
+    v = cache_run(tmp_path)
+    assert v["cache"]["baseline"] == {"fresh_in": 56000.0, "cached_in": 0.0, "share": 0.0}
+    assert v["cache"]["candidate"] == {"fresh_in": 4 * 10100.0, "cached_in": 4 * 40000.0,
+                                       "share": round(40000 / 50100, 4)}
+    assert v["tokens"]["candidate"]["input_per_case"] == 50100  # cached is part of input
+
+
+def test_cached_input_is_priced_at_its_own_rate_only_when_the_rate_is_given(tmp_path):
+    fresh = cache_run(tmp_path / "a", price_in=5, price_out=25)
+    assert fresh["candidate_cost_per_case"] == pytest.approx((50100 * 5 + 1500 * 25) / 1e6)
+    assert fresh["cost_basis"].endswith("cached input priced as fresh: pass --price-cached")
+    aware = cache_run(tmp_path / "b", price_in=5, price_out=25, price_cached=0.5)
+    assert aware["candidate_cost_per_case"] == pytest.approx(
+        (10100 * 5 + 40000 * 0.5 + 1500 * 25) / 1e6)
+    assert aware["baseline_cost_per_case"] == fresh["baseline_cost_per_case"]  # nothing cached
+    assert aware["cost_basis"].endswith("cached input at the cached rate")
+    with pytest.raises(ValueError):
+        cache_run(tmp_path / "c", price_cached=0.5)
+
+
+def test_an_unrecorded_cache_split_is_said_and_never_guessed(tmp_path):
+    assert ontology_sql.tokens(control_row(0, True))[4] is None  # the call has no cached count
+    one_missing = ((100, 10, 110, 50), (100, 10, 110))
+    assert ontology_sql.tokens(control_row(0, True, calls=one_missing))[4] is None
+    v = cache_run(tmp_path, control_calls=((14000, 800, 14800),), price_in=5, price_out=25,
+                  price_cached=0.5)
+    assert v["cache"]["baseline"] is None and v["cache"]["line"] is None
+    assert v["cache"]["candidate"]["cached_in"] == 160000.0
+    assert "cache split not recorded" in v["cost_basis"]
+    # one arm priced with its cache and the other without would bias the comparison
+    assert v["candidate_cost_per_case"] == pytest.approx((50100 * 5 + 1500 * 25) / 1e6)
+
+
+def test_a_ten_point_move_in_the_cache_hit_share_gets_its_own_line(tmp_path):
+    rose = cache_run(tmp_path / "a")
+    assert rose["cache"]["line"] == "the candidate's cache-hit share rose from 0% to 80%"
+    fell = cache_run(tmp_path / "b", control_calls=WARM, treatment_calls=COLD)
+    assert fell["cache"]["line"] == "the candidate's cache-hit share fell from 80% to 0%"
+    near = ((10000, 100, 10100, 7100),)  # 71% against 80%: under ten points
+    assert cache_run(tmp_path / "c", control_calls=WARM,
+                     treatment_calls=near)["cache"]["line"] is None
+
+
+def test_the_cached_rate_moves_cost_and_never_the_quality_verdict(tmp_path):
+    quality = ("quality", "won", "lost", "cases", "unanswered", "baseline_passed",
+               "candidate_passed", "quality_gap", "gain", "segments")
+
+    def at(sub, **price):
+        return ontology_sql.compare(write_run(
+            tmp_path / sub, [control_row(i, i >= 2, calls=COLD) for i in range(160)],
+            [treatment_row(i, i not in (2, 3), calls=WARM) for i in range(160)]), **price)
+    plain = at("a", price_in=5, price_out=5)
+    aware = at("b", price_in=5, price_out=5, price_cached=0.05)
+    assert plain["cost"] == "dearer" and aware["cost"] == "cheaper"
+    assert aware["candidate_cost_per_case"] < plain["candidate_cost_per_case"]
+    assert {k: plain[k] for k in quality} == {k: aware[k] for k in quality}
+    assert aware["quality"] == "holds" and not aware["gain"]["proven"]
+    # the cost column is the only thing that moved: a cheaper arm that holds may ship
+    assert (plain["decision"], aware["decision"]) == ("not_enough_evidence", "ship")
+    # a losing arm stays do_not_ship however cheap its cached input is
+    lost = ontology_sql.compare(write_run(
+        tmp_path / "c", [control_row(i, True, calls=COLD) for i in range(160)],
+        [treatment_row(i, i >= 30, calls=WARM) for i in range(160)]),
+        price_in=5, price_out=25, price_cached=0.0)
+    assert lost["decision"] == "do_not_ship" and not lost["promoted"]
+
+
 def test_without_a_price_cost_is_not_recorded_and_nothing_is_promoted(tmp_path):
     v = run(tmp_path, lambda i: True, lambda i: True)
     assert v["cost"] == "not_recorded" and v["cost_basis"].startswith("not recorded")
@@ -246,6 +338,15 @@ def test_the_command_prints_the_verdict_and_json(tmp_path, capsys):
     text = capsys.readouterr().out
     assert text.startswith("ship_if_worth_the_cost: a proven gain: the candidate won 40, lost 0")
     assert "control 2700 in / 500 out, treatment 38000 in / 5700 out (13.66x)" in text
+    assert "cache-hit share of input: control cache split not recorded, treatment 24%" in text
+    root2 = write_run(tmp_path / "warm", [control_row(i, True, calls=COLD) for i in range(4)],
+                      [treatment_row(i, True, calls=WARM) for i in range(4)])
+    cli.main(["ontology-sql", root2, "--price-in", "5", "--price-out", "25",
+              "--price-cached", "0.5"])
+    text = capsys.readouterr().out
+    assert "cache-hit share of input: control 0%, treatment 80%" in text
+    assert "  the candidate's cache-hit share rose from 0% to 80%" in text
+    assert "cached input at the cached rate" in text
     out = tmp_path / "receipt.json"
     assert cli.main(["ontology-sql", root, "--candidate-arm", "ontology", "--json",
                      "--receipt", str(out)]) == 1

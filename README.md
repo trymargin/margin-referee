@@ -54,6 +54,44 @@ make it unreliable, and this tool corrects for each:
   on the cases that got worse. It is a weighting of the same cases, not a new test: the decision
   stays on the unweighted paired test.
 
+## Runs that cannot reach a verdict are refused before they spend
+
+A paid replay that ends `not_enough_evidence` for a reason you could have known first is wasted
+money. `replay` checks for those reasons in order and stops at the first one it finds. The
+decision is then `refused_before_spend`, the reason is the first line printed, and the exit
+code is 3.
+
+1. **Size, free.** If you have fewer gradable cases than the gate needs (`cases_needed`, 100
+   for one candidate), no result could be `ship`, so nothing runs. `--anyway` runs it as a
+   check that can only find a loss, and the output says so.
+2. **Smoke, a few cents.** The first two cases run on both models. If a call errors (a model
+   id that does not exist, a 4xx or 5xx, a schema the endpoint rejects, an answer the check
+   cannot read), the run stops with the exact error and what it spent. An answer cut off by
+   the output limit is retried once at double the limit, up to 32768 tokens. If it is still
+   cut off, the run stops and names the limit. Set the limit with `--max-tokens`.
+3. **Budget.** The full run is estimated from the two smoke cases plus 20%. If that is more
+   than `--cap`, the run stops and names the cap it would need. On OpenRouter it also reads
+   what your key can still spend. If the estimate is more than that, the run stops. If the
+   balance cannot be read, the output says `balance not checked` and the run goes on.
+
+The two smoke cases are the first two cases of the full run, so a run that goes ahead pays
+for nothing twice.
+
+Three more guards work during the run:
+
+- A 402 (out of credit) stops the run at once. Every later call would fail the same way.
+- A case lost to a 429, a 5xx, a timeout or a dropped connection is tried once more when the
+  run ends. So is an answer cut off by the output limit, at double the limit. A 400, 401, 403,
+  404 or 422 is not retried: the same call would fail again.
+- If so many cases have no answer that the rest cannot reach `cases_needed`, the run stops
+  and says so. No later case could have made the verdict `ship`.
+
+Every verdict carries a `preflight` block: `size`, `smoke`, `budget`, `estimate_usd`,
+`balance_usd` and the `max_tokens` the run ended up using.
+
+Exit codes for `replay`: 0 promote, 1 do not promote, 2 no case can be graded, 3 refused
+before spend.
+
 ## Testing a tool change
 
 A tool description is a prompt the model reads on every call. Rewrite one, or add or remove a
@@ -83,12 +121,13 @@ the same:
 cd examples/tool_change
 OPENROUTER_API_KEY=... margin-referee replay cases.jsonl \
     --baseline openai/gpt-4.1 --candidate openai/gpt-4.1 \
-    --candidate-tools candidate_tools.json --cap 1
+    --candidate-tools candidate_tools.json --cap 1 --anyway
 ```
 
 `examples/tool_change` has three cases and a `candidate_tools.json` that rewrites two vague
-descriptions. Three cases show the format and prove nothing: the verdict on them is
-`not_enough_evidence`, and `fit` says how many cases you need. Each tool list you try counts as
+descriptions. Three cases show the format and prove nothing: without `--anyway` the replay is
+refused before it spends, with it the verdict is `not_enough_evidence`, and `fit` says how many
+cases you need. Each tool list you try counts as
 a candidate, the same as a prompt. Tool cases run on OpenRouter and on OpenAI-compatible, Azure
 OpenAI and Vertex AI endpoints; a Bedrock endpoint leaves them unanswered for now. A promptfoo
 results file carries no tool list, so write tool cases as JSONL.
@@ -129,7 +168,7 @@ says whether to ship the layer. It calls no model and needs nothing of NVIDIA's 
 
 ```
 margin-referee ontology-sql runs
-margin-referee ontology-sql runs/full_20261126 --price-in 5 --price-out 25 --json
+margin-referee ontology-sql runs/full_20261126 --price-in 5 --price-out 25 --price-cached 0.5 --json
 ```
 
 It reads `<run>/control/<dataset>.jsonl` and `<run>/treatment/<dataset>.jsonl`, pairs the
@@ -146,6 +185,18 @@ own report:
   one, otherwise from the ontology arm's own totals. Cost is those tokens times the
   `--price-in` and `--price-out` you give (USD per million tokens). The files carry no price,
   so without both flags cost reads `not_recorded` and nothing is guessed.
+- Cached input is read per call (`cached_tokens` in the capture block, otherwise the ontology
+  arm's `agent_cached_input_tokens`) and is part of the input count. Give `--price-cached`
+  (USD per million cached input tokens) to price it at its own rate. Without that flag cached
+  input is priced as fresh, and the cost basis says so. The cached rate is used only when both
+  arms recorded the split; if either did not, the output says `cache split not recorded` and
+  all input is priced as fresh. No split is guessed.
+- The cache-hit share (cached input over all input) is printed for each arm, and the JSON has
+  `cache: {baseline: {fresh_in, cached_in, share}, candidate: {...}, line}`, totals over the
+  paired questions. When the two arms differ by ten points or more you get a line such as
+  `the candidate's cache-hit share fell from 80% to 12%`, so a change that breaks prompt
+  caching shows up. The share changes cost only. It never changes a pass, a fail or the
+  quality verdict.
 - The ontology arm makes many more calls per question. If the pass rate only holds, the answer
   is `not_enough_evidence`: a layer that is not cheaper ships on a proven gain. If the gain is
   proven it reads `ship_if_worth_the_cost`, with the questions won and lost and the 95% bound
@@ -156,8 +207,10 @@ own report:
 `--baseline-arm` and `--candidate-arm` name the two folders, or two rollout files, if yours are
 called something else. Swap them to ask the opposite question: can the layer be dropped?
 
-Not checked against a real run: the file layout and field names were read from the harness
-source at commit `871bb924` (2026-11-26) and the tests use rows made in that shape.
+The file layout and field names were read from the harness source at commit `871bb924`
+(2026-11-26) and the tests use rows made in that shape. The cached-input field names were read
+from one real run's files (WideWorldImporters, 41 questions, 2026-11-27). Prices you pass are
+yours: a list price is not what a gateway billed.
 
 ## A receipt for the verdict
 
